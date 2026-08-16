@@ -178,7 +178,13 @@ func main() {
 	}()
 
 	if !*noBrowserFlag {
-		openBrowser(fmt.Sprintf("http://127.0.0.1:%d", port))
+		// Include the PIN for the local operator's browser (it is already
+		// displayed in this terminal); avoids a 401 loop on the WebSocket.
+		localURL := fmt.Sprintf("http://127.0.0.1:%d", port)
+		if cfg.PIN != "" {
+			localURL = fmt.Sprintf("%s/?pin=%s", localURL, cfg.PIN)
+		}
+		openBrowser(localURL)
 	}
 
 	<-stopChan

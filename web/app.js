@@ -67,13 +67,19 @@
   // Auth & Info
   async function checkAuthAndLoadInfo() {
     try {
-      const res = await fetch("/api/info");
-      if (res.status === 401) {
-        showPinModal();
-        return;
+      // /api/info is auth-exempt; probe an auth-enforced endpoint to detect
+      // whether a PIN is required so the modal can actually appear.
+      const [infoRes, probeRes] = await Promise.all([
+        fetch("/api/info"),
+        fetch("/api/files"),
+      ]);
+      if (infoRes.ok) {
+        const data = await infoRes.json();
+        serverNameEl.textContent = `${data.hostname || "LAN-Server"} (${data.host_ip}:${data.port})`;
       }
-      const data = await res.json();
-      serverNameEl.textContent = `${data.hostname || "LAN-Server"} (${data.host_ip}:${data.port})`;
+      if (probeRes.status === 401) {
+        showPinModal();
+      }
     } catch (err) {
       serverNameEl.textContent = "LAN Server";
     }
