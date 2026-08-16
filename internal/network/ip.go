@@ -6,15 +6,26 @@ import (
 	"strings"
 )
 
-// GetLocalIPs returns all valid IPv4 LAN addresses, prioritizing standard private ranges.
-func GetLocalIPs() ([]string, error) {
-	interfaces, err := net.Interfaces()
-	if err != nil {
-		return nil, fmt.Errorf("failed to get network interfaces: %w", err)
+// LANInfo groups detected IPv4 LAN addresses by adapter kind. Only Physical
+// addresses are reachable from other devices (phones); Virtual ones belong to
+// WSL / Hyper-V / container stacks and are shown as text reference only.
+type LANInfo struct {
+	Physical []string
+	Virtual  []string
+}
+
+// GetLANInfo returns private IPv4 addresses grouped by adapter kind, with
+// standard private ranges prioritized.
+func GetLANInfo() LANInfo {
+	info := LANInfo{
+		Physical: []string{},
+		Virtual:  []string{},
 	}
 
-	var primaryIPs []string
-	var secondaryIPs []string
+	interfaces, err := net.Interfaces()
+	if err != nil {
+		return LANInfo{Physical: []string{"127.0.0.1"}}
+	}
 
 	for _, iface := range interfaces {
 		// Skip down and loopback interfaces
@@ -71,21 +82,26 @@ func GetLocalIPs() ([]string, error) {
 			ipStr := ip.To4().String()
 
 			if isPrivateIP(ip) {
-				if !isVirtual {
-					primaryIPs = append(primaryIPs, ipStr)
+				if isVirtual {
+					info.Virtual = append(info.Virtual, ipStr)
 				} else {
-					secondaryIPs = append(secondaryIPs, ipStr)
+					info.Physical = append(info.Physical, ipStr)
 				}
 			}
 		}
 	}
 
-	result := append(primaryIPs, secondaryIPs...)
-	if len(result) == 0 {
-		return []string{"127.0.0.1"}, nil
+	if len(info.Physical) == 0 && len(info.Virtual) == 0 {
+		return LANInfo{Physical: []string{"127.0.0.1"}}
 	}
+	return info
+}
 
-	return result, nil
+// GetLocalIPs returns every detected private IPv4 address, physical adapters
+// first. Kept for callers that only need a flat ordered list.
+func GetLocalIPs() ([]string, error) {
+	info := GetLANInfo()
+	return append(info.Physical, info.Virtual...), nil
 }
 
 // FindAvailablePort starts searching from defaultPort until an open port is found.

@@ -30,6 +30,19 @@ func TestIsPrivateIP(t *testing.T) {
 	}
 }
 
+func TestGetLANInfoSplitsPhysicalAndVirtual(t *testing.T) {
+	info := GetLANInfo()
+	if len(info.Physical) == 0 && len(info.Virtual) == 0 {
+		t.Fatal("GetLANInfo returned nothing (fallback should guarantee 127.0.0.1)")
+	}
+	// Every physical address must be a private IPv4
+	for _, ip := range info.Physical {
+		if !isPrivateIP(net.ParseIP(ip)) {
+			t.Errorf("physical list contains non-private IP %s", ip)
+		}
+	}
+}
+
 func TestGetLocalIPsReturnsSomething(t *testing.T) {
 	ips, err := GetLocalIPs()
 	if err != nil {

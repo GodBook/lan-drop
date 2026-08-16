@@ -54,10 +54,15 @@ func main() {
 
 	console.EnableANSI()
 
-	// 1. Detect Network LAN IPs
-	ips, err := network.GetLocalIPs()
-	if err != nil || len(ips) == 0 {
-		ips = []string{"127.0.0.1"}
+	// 1. Detect Network LAN IPs (grouped: physical adapters are phone-reachable,
+	// virtual ones like WSL are not and stay as text reference only)
+	lan := network.GetLANInfo()
+	ips := lan.Physical
+	if len(ips) == 0 {
+		ips = lan.Virtual // degenerate case: no physical private IP at all
+		if len(ips) == 0 {
+			ips = []string{"127.0.0.1"}
+		}
 	}
 	primaryIP := ips[0]
 
@@ -112,13 +117,14 @@ func main() {
 		fmt.Println(" 🔓 访问认证       : 已关闭 PIN 保护")
 	}
 	fmt.Printf(" 📂 文件存储目录   : %s\n", uploadDir)
-	if len(ips) > 1 {
-		fmt.Printf(" 💡 备用局域网 IP  : %v\n", ips[1:])
+	if backup := append(append([]string{}, ips[1:]...), lan.Virtual...); len(backup) > 0 {
+		fmt.Printf(" 💡 备用/虚拟 IP  : %v (虚拟网卡不可扫码)\n", backup)
 	}
 	fmt.Println("------------------------------------------------------------------")
 
-	// One QR per candidate NIC so the right one can be scanned even when the
-	// primary guess is on another subnet.
+	// One QR per physical NIC so the right one can be scanned when several
+	// real adapters exist (e.g. Ethernet + Wi-Fi). Virtual adapters never
+	// get a QR: phones cannot reach them.
 	qrIPs := ips
 	if len(qrIPs) > maxQRCodes {
 		qrIPs = qrIPs[:maxQRCodes]
