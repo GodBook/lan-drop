@@ -474,3 +474,51 @@ button {
   border-radius: 8px;
   color: var(--text-main);
 }
+
+/* ===== Media Preview Modal ===== */
+.preview-overlay {
+  cursor: zoom-out;
+}
+
+.preview-body {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 12px;
+  max-width: 92vw;
+  max-height: 92vh;
+}
+
+.preview-title {
+  color: var(--text-main);
+  font-size: 14px;
+  font-weight: 600;
+  background: rgba(0, 0, 0, 0.5);
+  padding: 6px 14px;
+  border-radius: 6px;
+  max-width: 90vw;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.preview-body img {
+  max-width: 90vw;
+  max-height: 78vh;
+  border-radius: 8px;
+  box-shadow: 0 8px 40px rgba(0, 0, 0, 0.6);
+  object-fit: contain;
+}
+
+.preview-body video {
+  max-width: 90vw;
+  max-height: 78vh;
+  border-radius: 8px;
+  background: #000;
+  box-shadow: 0 8px 40px rgba(0, 0, 0, 0.6);
+}
+
+.preview-body audio {
+  width: 80vw;
+  max-width: 480px;
+}

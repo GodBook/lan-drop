@@ -2,6 +2,9 @@ package server
 
 import (
 	"crypto/rand"
+	"crypto/subtle"
+	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"io/fs"
 	"math/big"
@@ -21,24 +24,41 @@ type TextMessage struct {
 
 // FileItem represents an uploaded file
 type FileItem struct {
-	Name      string    `json:"name"`
-	Size      int64     `json:"size"`
-	ModTime   time.Time `json:"mod_time"`
-	Type      string    `json:"type"`
-	URL       string    `json:"url"`
+	Name    string    `json:"name"`
+	Size    int64     `json:"size"`
+	ModTime time.Time `json:"mod_time"`
+	Type    string    `json:"type"`
+	URL     string    `json:"url"`
+}
+
+const (
+	sessionTTL        = 7 * 24 * time.Hour
+	authMaxFailures   = 5
+	authLockDuration  = 30 * time.Second
+	feedStoreFileName = ".landrop_feed.json"
+)
+
+type authFailState struct {
+	count       int
+	lockedUntil time.Time
 }
 
 // Config holds runtime configuration and in-memory states
 type Config struct {
-	Port       int
-	HostIP     string
-	UploadDir  string
-	PIN        string
-	StaticFS   fs.FS
-	
+	Port      int
+	HostIP    string
+	UploadDir string
+	PIN       string
+	StaticFS  fs.FS
+
 	mu         sync.RWMutex
 	TextFeed   []TextMessage
 	MaxFeedLen int
+	feedPath   string
+
+	sessions  map[string]time.Time // random session token -> expiry
+	authMu    sync.Mutex
+	authFails map[string]*authFailState
 }
 
 // NewConfig initializes default configuration
@@ -53,11 +73,9 @@ func NewConfig(port int, hostIP, uploadDir, pin string, staticFS fs.FS) *Config 
 	}
 	_ = os.MkdirAll(uploadDir, 0755)
 
-	if pin == "" {
-		pin = generateRandomPIN(4)
-	}
-
-	return &Config{
+	// An empty PIN explicitly means "auth disabled"; callers decide whether to
+	// generate a random one (see GenerateRandomPIN).
+	cfg := &Config{
 		Port:       port,
 		HostIP:     hostIP,
 		UploadDir:  uploadDir,
@@ -65,7 +83,87 @@ func NewConfig(port int, hostIP, uploadDir, pin string, staticFS fs.FS) *Config 
 		StaticFS:   staticFS,
 		TextFeed:   make([]TextMessage, 0),
 		MaxFeedLen: 50,
+		feedPath:   filepath.Join(uploadDir, feedStoreFileName),
+		sessions:   make(map[string]time.Time),
+		authFails:  make(map[string]*authFailState),
 	}
+	cfg.loadFeedFromDisk()
+	return cfg
+}
+
+// CheckPIN compares a candidate PIN in constant time. An empty configured PIN
+// means authentication is disabled and everything passes.
+func (c *Config) CheckPIN(input string) bool {
+	if c.PIN == "" {
+		return true
+	}
+	return subtle.ConstantTimeCompare([]byte(input), []byte(c.PIN)) == 1
+}
+
+// CreateSession mints a random 256-bit session token valid for sessionTTL.
+// Sessions decouple the browser cookie from the PIN itself.
+func (c *Config) CreateSession() string {
+	buf := make([]byte, 32)
+	if _, err := rand.Read(buf); err != nil {
+		// crypto/rand failure is practically fatal; fall back to time-based token
+		return fmt.Sprintf("%x", time.Now().UnixNano())
+	}
+	token := hex.EncodeToString(buf)
+	c.mu.Lock()
+	c.sessions[token] = time.Now().Add(sessionTTL)
+	// Opportunistic sweep of expired entries
+	now := time.Now()
+	for t, exp := range c.sessions {
+		if now.After(exp) {
+			delete(c.sessions, t)
+		}
+	}
+	c.mu.Unlock()
+	return token
+}
+
+// ValidSession reports whether the token belongs to a live session.
+func (c *Config) ValidSession(token string) bool {
+	if token == "" {
+		return false
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	exp, ok := c.sessions[token]
+	return ok && time.Now().Before(exp)
+}
+
+// IsAuthLocked reports whether the source IP is temporarily locked out after
+// repeated PIN failures.
+func (c *Config) IsAuthLocked(ip string) bool {
+	c.authMu.Lock()
+	defer c.authMu.Unlock()
+	st, ok := c.authFails[ip]
+	return ok && time.Now().Before(st.lockedUntil)
+}
+
+// RecordAuthFailure counts a failed attempt and locks the IP after
+// authMaxFailures consecutive failures.
+func (c *Config) RecordAuthFailure(ip string) {
+	c.authMu.Lock()
+	defer c.authMu.Unlock()
+	st, ok := c.authFails[ip]
+	if !ok {
+		st = &authFailState{}
+		c.authFails[ip] = st
+	}
+	st.count++
+	if st.count >= authMaxFailures {
+		st.lockedUntil = time.Now().Add(authLockDuration)
+		st.count = 0
+	}
+}
+
+// ClearAuthFailures resets the failure counter after a successful login.
+func (c *Config) ClearAuthFailures(ip string) {
+	c.authMu.Lock()
+	defer c.authMu.Unlock()
+	delete(c.authFails, ip)
 }
 
 func (c *Config) AddTextMessage(msg TextMessage) {
@@ -75,6 +173,7 @@ func (c *Config) AddTextMessage(msg TextMessage) {
 	if len(c.TextFeed) > c.MaxFeedLen {
 		c.TextFeed = c.TextFeed[:c.MaxFeedLen]
 	}
+	c.saveFeedLocked()
 }
 
 func (c *Config) GetTextFeed() []TextMessage {
@@ -85,7 +184,35 @@ func (c *Config) GetTextFeed() []TextMessage {
 	return res
 }
 
-func generateRandomPIN(length int) string {
+// loadFeedFromDisk restores the text history persisted by previous runs.
+func (c *Config) loadFeedFromDisk() {
+	data, err := os.ReadFile(c.feedPath)
+	if err != nil {
+		return
+	}
+	var feed []TextMessage
+	if json.Unmarshal(data, &feed) == nil && len(feed) > 0 {
+		if len(feed) > c.MaxFeedLen {
+			feed = feed[:c.MaxFeedLen]
+		}
+		c.TextFeed = feed
+	}
+}
+
+// saveFeedLocked persists the feed atomically (temp file + rename); caller must
+// hold c.mu.
+func (c *Config) saveFeedLocked() {
+	data, err := json.Marshal(c.TextFeed)
+	if err != nil {
+		return
+	}
+	tmp := c.feedPath + ".tmp"
+	if os.WriteFile(tmp, data, 0600) == nil {
+		_ = os.Rename(tmp, c.feedPath)
+	}
+}
+
+func GenerateRandomPIN(length int) string {
 	digits := "0123456789"
 	pin := make([]byte, length)
 	for i := 0; i < length; i++ {

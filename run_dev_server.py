@@ -1,11 +1,19 @@
 #!/usr/bin/env python3
 """
-LAN Drop - Lightweight Python Development Runner
-Implements the same API specs to preview the Web UI and APIs instantly without Go installed.
-"""
+LAN Drop - Lightweight Python Development Runner (DEPRECATED)
+Implements a subset of the API to preview the Web UI without Go installed.
 
+NOTE: This dev-only preview server no longer tracks the Go implementation
+(session auth, rate limiting, upload resume, feed persistence are missing).
+It will be removed in a future release — build the single Go binary instead:
+    go build -ldflags="-s -w" -o landrop .
+"""
 import os
 import sys
+
+print("!! [DEPRECATED] run_dev_server.py is a dev-only preview and lags behind the Go server.")
+print("!! Prefer building the real binary:  go build -ldflags=\"-s -w\" -o landrop .")
+
 import json
 import time
 import socket

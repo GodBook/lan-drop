@@ -8,22 +8,31 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
 )
 
-const wsGUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+const (
+	wsGUID            = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+	maxWSMessageSize  = 1 << 20          // hard cap for a single WebSocket message (1MB)
+	wsPingInterval    = 30 * time.Second // server keepalive period
+	wsReadIdleTimeout = 90 * time.Second // drop connections silent longer than this
+	wsWriteTimeout    = 10 * time.Second // per-frame write deadline
+)
 
 type WSClient struct {
-	conn   net.Conn
-	bufr   *bufio.Reader
-	send   chan []byte
-	hub    *WSHub
-	closed bool
-	mu     sync.Mutex
+	conn    net.Conn
+	bufr    *bufio.Reader
+	send    chan []byte
+	hub     *WSHub
+	closed  bool
+	mu      sync.Mutex
+	writeMu sync.Mutex // serializes raw frame writes between read/write pumps
 }
 
 type WSHub struct {
@@ -31,6 +40,8 @@ type WSHub struct {
 	broadcast  chan []byte
 	register   chan *WSClient
 	unregister chan *WSClient
+	done       chan struct{}
+	stopOnce   sync.Once
 	mu         sync.RWMutex
 	cfg        *Config
 }
@@ -41,6 +52,7 @@ func NewWSHub(cfg *Config) *WSHub {
 		broadcast:  make(chan []byte, 256),
 		register:   make(chan *WSClient),
 		unregister: make(chan *WSClient),
+		done:       make(chan struct{}),
 		cfg:        cfg,
 	}
 }
@@ -48,6 +60,15 @@ func NewWSHub(cfg *Config) *WSHub {
 func (h *WSHub) Run() {
 	for {
 		select {
+		case <-h.done:
+			h.mu.Lock()
+			for client := range h.clients {
+				delete(h.clients, client)
+				client.Close()
+			}
+			h.mu.Unlock()
+			return
+
 		case client := <-h.register:
 			h.mu.Lock()
 			h.clients[client] = true
@@ -73,24 +94,33 @@ func (h *WSHub) Run() {
 			h.mu.Unlock()
 
 		case message := <-h.broadcast:
-			h.mu.RLock()
+			h.mu.Lock()
 			for client := range h.clients {
 				select {
 				case client.send <- message:
 				default:
+					// Client buffer full: treat as dead
 					delete(h.clients, client)
 					client.Close()
 				}
 			}
-			h.mu.RUnlock()
+			h.mu.Unlock()
 		}
 	}
+}
+
+// Shutdown terminates the hub loop and closes every live client connection.
+func (h *WSHub) Shutdown() {
+	h.stopOnce.Do(func() { close(h.done) })
 }
 
 func (h *WSHub) BroadcastJSON(v interface{}) {
 	data, err := json.Marshal(v)
 	if err == nil {
-		h.broadcast <- data
+		select {
+		case h.broadcast <- data:
+		case <-h.done:
+		}
 	}
 }
 
@@ -104,12 +134,34 @@ func (c *WSClient) Close() {
 	}
 }
 
+// writeFrame serializes all raw writes (data frames, pings, pongs) so concurrent
+// pumps can never interleave bytes on the wire, and applies a write deadline.
+func (c *WSClient) writeFrame(opcode byte, payload []byte) error {
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+	_ = c.conn.SetWriteDeadline(time.Now().Add(wsWriteTimeout))
+	return writeWSFrame(c.conn, opcode, payload)
+}
+
 func (c *WSClient) writePump() {
 	defer c.hub.unregisterClient(c)
-	for message := range c.send {
-		err := writeWSFrame(c.conn, 0x1, message) // Text frame
-		if err != nil {
-			break
+	ticker := time.NewTicker(wsPingInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case message, ok := <-c.send:
+			if !ok {
+				_ = c.writeFrame(0x8, []byte{})
+				return
+			}
+			if err := c.writeFrame(0x1, message); err != nil { // Text frame
+				return
+			}
+		case <-ticker.C:
+			// Keepalive ping; browsers answer automatically at protocol level
+			if err := c.writeFrame(0x9, []byte("landrop-ping")); err != nil {
+				return
+			}
 		}
 	}
 }
@@ -117,18 +169,20 @@ func (c *WSClient) writePump() {
 func (c *WSClient) readPump() {
 	defer c.hub.unregisterClient(c)
 	for {
-		opcode, payload, err := readWSFrame(c.bufr)
+		_ = c.conn.SetReadDeadline(time.Now().Add(wsReadIdleTimeout))
+		opcode, payload, err := readWSFrame(c.bufr, maxWSMessageSize)
 		if err != nil {
-			break
+			return
 		}
-		if opcode == 0x8 { // Close frame
-			break
-		}
-		if opcode == 0x9 { // Ping frame
-			_ = writeWSFrame(c.conn, 0xA, payload) // Pong
-			continue
-		}
-		if opcode == 0x1 { // Text frame
+		switch opcode {
+		case 0x8: // Close frame
+			return
+		case 0x9: // Ping -> Pong
+			if err := c.writeFrame(0xA, payload); err != nil {
+				return
+			}
+		case 0xA: // Pong: keepalive answer, nothing to do
+		case 0x1: // Text frame
 			var req map[string]interface{}
 			if err := json.Unmarshal(payload, &req); err == nil {
 				msgType, _ := req["type"].(string)
@@ -145,7 +199,6 @@ func (c *WSClient) readPump() {
 							Sender:    sender,
 							Timestamp: time.Now(),
 						}
-						// Record and broadcast
 						c.hub.cfg.AddTextMessage(msg)
 						c.hub.BroadcastJSON(map[string]interface{}{
 							"type": "new_text",
@@ -159,11 +212,24 @@ func (c *WSClient) readPump() {
 }
 
 func (h *WSHub) unregisterClient(c *WSClient) {
-	h.unregister <- c
+	select {
+	case h.unregister <- c:
+	case <-h.done:
+	}
 }
 
 // ServeWebSocket upgrades HTTP request to RFC-6455 WebSocket
 func (h *WSHub) ServeWebSocket(w http.ResponseWriter, r *http.Request) {
+	// Cross-Site WebSocket Hijacking guard: when a browser supplies an Origin,
+	// it must point at this host. Non-browser clients send no Origin and pass.
+	if origin := r.Header.Get("Origin"); origin != "" {
+		u, err := url.Parse(origin)
+		if err != nil || !strings.EqualFold(u.Host, r.Host) {
+			http.Error(w, "Origin not allowed", http.StatusForbidden)
+			return
+		}
+	}
+
 	if !strings.EqualFold(r.Header.Get("Upgrade"), "websocket") {
 		http.Error(w, "Expected websocket upgrade", http.StatusBadRequest)
 		return
@@ -209,7 +275,12 @@ func (h *WSHub) ServeWebSocket(w http.ResponseWriter, r *http.Request) {
 		hub:  h,
 	}
 
-	h.register <- client
+	select {
+	case h.register <- client:
+	case <-h.done:
+		_ = conn.Close()
+		return
+	}
 
 	go client.writePump()
 	go client.readPump()
@@ -245,7 +316,9 @@ func writeWSFrame(w io.Writer, opcode byte, payload []byte) error {
 	return nil
 }
 
-func readWSFrame(r io.Reader) (byte, []byte, error) {
+// readWSFrame reads one frame, refusing lengths above maxLen so a malformed or
+// hostile peer can never make the server allocate unbounded memory.
+func readWSFrame(r io.Reader, maxLen int) (byte, []byte, error) {
 	header := make([]byte, 2)
 	if _, err := io.ReadFull(r, header); err != nil {
 		return 0, nil, err
@@ -253,20 +326,28 @@ func readWSFrame(r io.Reader) (byte, []byte, error) {
 
 	opcode := header[0] & 0x0F
 	isMasked := (header[1] & 0x80) != 0
-	payloadLen := int(header[1] & 0x7F)
+	payloadLen := int64(header[1] & 0x7F)
 
 	if payloadLen == 126 {
 		lenBytes := make([]byte, 2)
 		if _, err := io.ReadFull(r, lenBytes); err != nil {
 			return 0, nil, err
 		}
-		payloadLen = int(binary.BigEndian.Uint16(lenBytes))
+		payloadLen = int64(binary.BigEndian.Uint16(lenBytes))
 	} else if payloadLen == 127 {
 		lenBytes := make([]byte, 8)
 		if _, err := io.ReadFull(r, lenBytes); err != nil {
 			return 0, nil, err
 		}
-		payloadLen = int(binary.BigEndian.Uint64(lenBytes))
+		u := binary.BigEndian.Uint64(lenBytes)
+		if u > uint64(math.MaxInt64) {
+			return 0, nil, fmt.Errorf("websocket frame length overflow: %d", u)
+		}
+		payloadLen = int64(u)
+	}
+
+	if payloadLen > int64(maxLen) {
+		return 0, nil, fmt.Errorf("websocket frame too large: %d bytes (max %d)", payloadLen, maxLen)
 	}
 
 	var maskKey []byte
@@ -283,7 +364,7 @@ func readWSFrame(r io.Reader) (byte, []byte, error) {
 	}
 
 	if isMasked {
-		for i := 0; i < payloadLen; i++ {
+		for i := range payload {
 			payload[i] ^= maskKey[i%4]
 		}
 	}

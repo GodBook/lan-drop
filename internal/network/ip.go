@@ -32,7 +32,23 @@ func GetLocalIPs() ([]string, error) {
 			strings.Contains(name, "tailscale") ||
 			strings.Contains(name, "tun") ||
 			strings.Contains(name, "tap") ||
-			strings.Contains(name, "wg")
+			strings.Contains(name, "wg") ||
+			// Windows virtualization stacks (WSL, Hyper-V, NAT, mirrored adapters)
+			strings.Contains(name, "vethernet") ||
+			strings.Contains(name, "wsl") ||
+			strings.Contains(name, "hyper-v") ||
+			strings.Contains(name, "nat") ||
+			strings.Contains(name, "loopback") ||
+			strings.Contains(name, "virtual") ||
+			// macOS / Linux extras
+			strings.Contains(name, "bridge") ||
+			strings.Contains(name, "awdl") ||
+			strings.Contains(name, "llw") ||
+			strings.Contains(name, "anbox") ||
+			strings.Contains(name, "bluetooth") ||
+			strings.Contains(name, "zt") ||
+			strings.Contains(name, "hamachi") ||
+			strings.Contains(name, "ifb")
 
 		addrs, err := iface.Addrs()
 		if err != nil {

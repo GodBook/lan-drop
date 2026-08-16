@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"embed"
 	"flag"
 	"fmt"
@@ -8,11 +9,14 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"syscall"
 	"time"
 
+	"landrop/internal/console"
 	"landrop/internal/network"
 	"landrop/internal/qrcode"
 	"landrop/internal/server"
@@ -21,17 +25,36 @@ import (
 //go:embed web/*
 var embeddedWebFS embed.FS
 
-// AppVersion is the current release version of LAN Drop.
-const AppVersion = "1.0.0"
+// AppVersion is the current release version; CI overrides it at build time
+// via -ldflags "-X main.AppVersion=<version>".
+var AppVersion = "1.1.0"
+
+// maxQRCodes caps how many network interfaces get a scannable code on startup.
+const maxQRCodes = 3
+
+// tempChunkMaxAge and the sweeper interval control cleanup of aborted uploads.
+const (
+	tempChunkMaxAge   = 2 * time.Hour
+	tempSweepInterval = 30 * time.Minute
+)
 
 func main() {
 	portFlag := flag.Int("p", 8087, "Service port (default: 8087)")
 	dirFlag := flag.String("d", "", "Directory to save received files (default: ~/Downloads/LAN_Drop)")
 	pinFlag := flag.String("pin", "", "Custom PIN access code (default: randomly generated 4-digit)")
 	noPinFlag := flag.Bool("no-pin", false, "Disable PIN authentication")
+	noBrowserFlag := flag.Bool("no-browser", false, "Do not auto-open the browser on start")
+	versionFlag := flag.Bool("v", false, "Print version and exit")
 	flag.Parse()
 
-	// 1. Detect Network LAN IP
+	if *versionFlag {
+		fmt.Printf("LAN Drop v%s (%s/%s)\n", AppVersion, runtime.GOOS, runtime.GOARCH)
+		return
+	}
+
+	console.EnableANSI()
+
+	// 1. Detect Network LAN IPs
 	ips, err := network.GetLocalIPs()
 	if err != nil || len(ips) == 0 {
 		ips = []string{"127.0.0.1"}
@@ -53,10 +76,12 @@ func main() {
 	}
 	_ = os.MkdirAll(uploadDir, 0755)
 
-	// 4. Resolve PIN
+	// 4. Resolve PIN: random by default, empty when auth is disabled
 	pin := *pinFlag
 	if *noPinFlag {
 		pin = ""
+	} else if pin == "" {
+		pin = server.GenerateRandomPIN(4)
 	}
 
 	// 5. Setup embedded web FS
@@ -91,11 +116,29 @@ func main() {
 		fmt.Printf(" 💡 备用局域网 IP  : %v\n", ips[1:])
 	}
 	fmt.Println("------------------------------------------------------------------")
-	fmt.Println(" 📱 手机扫码直达 (用微信/系统相机扫描下方二维码)：")
-	fmt.Println()
 
-	qrOutput := qrcode.PrintTerminal(fullURL)
-	fmt.Print(qrOutput)
+	// One QR per candidate NIC so the right one can be scanned even when the
+	// primary guess is on another subnet.
+	qrIPs := ips
+	if len(qrIPs) > maxQRCodes {
+		qrIPs = qrIPs[:maxQRCodes]
+	}
+	for i, ip := range qrIPs {
+		label := " 📱 手机扫码直达"
+		if len(qrIPs) > 1 {
+			label = fmt.Sprintf(" 📱 二维码 %d/%d（网卡 %s）", i+1, len(qrIPs), ip)
+		}
+		fmt.Println(label + " (用微信/系统相机扫描)：")
+		fmt.Println()
+		qrURL := fmt.Sprintf("http://%s:%d", ip, port)
+		if cfg.PIN != "" {
+			qrURL = fmt.Sprintf("%s/?pin=%s", qrURL, cfg.PIN)
+		}
+		fmt.Print(qrcode.PrintTerminal(qrURL))
+		if i < len(qrIPs)-1 {
+			fmt.Println("------------------------------------------------------------------")
+		}
+	}
 	fmt.Println("==================================================================")
 	fmt.Println(" [提示] 按 Ctrl + C 可安全停止服务")
 	fmt.Println()
@@ -112,12 +155,47 @@ func main() {
 	stopChan := make(chan os.Signal, 1)
 	signal.Notify(stopChan, os.Interrupt, syscall.SIGTERM)
 
+	// Sweep orphaned chunk directories from aborted uploads
+	go func() {
+		srv.CleanupTempChunks(tempChunkMaxAge)
+		ticker := time.NewTicker(tempSweepInterval)
+		defer ticker.Stop()
+		for range ticker.C {
+			srv.CleanupTempChunks(tempChunkMaxAge)
+		}
+	}()
+
 	go func() {
 		if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Fatalf("Server error: %v", err)
 		}
 	}()
 
+	if !*noBrowserFlag {
+		openBrowser(fmt.Sprintf("http://127.0.0.1:%d", port))
+	}
+
 	<-stopChan
 	fmt.Println("\n正在关闭 LAN Drop 服务...")
+
+	// Real graceful shutdown: stop accepting, close WS clients, drain requests
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_ = httpServer.Shutdown(ctx)
+	srv.Shutdown()
+	fmt.Println("已安全退出。")
+}
+
+// openBrowser launches the default browser at url, best-effort.
+func openBrowser(url string) {
+	var cmd *exec.Cmd
+	switch runtime.GOOS {
+	case "windows":
+		cmd = exec.Command("cmd", "/c", "start", "", url)
+	case "darwin":
+		cmd = exec.Command("open", url)
+	default:
+		cmd = exec.Command("xdg-open", url)
+	}
+	_ = cmd.Start()
 }

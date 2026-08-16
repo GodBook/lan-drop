@@ -1,6 +1,7 @@
 // LAN Drop Frontend Core Engine
 (function () {
   const CHUNK_SIZE = 4 * 1024 * 1024; // 4MB per chunk
+  const PARALLEL_CHUNKS = 3;          // concurrent chunk uploads per file
 
   // State
   let ws = null;
@@ -8,6 +9,7 @@
   let textFeed = [];
   let fileList = [];
   let deviceName = getOrCreateDeviceName();
+  let listenersBound = false; // guard: register DOM listeners exactly once
 
   // DOM Elements
   const serverNameEl = document.getElementById("server-name");
@@ -28,12 +30,17 @@
   const pinModalEl = document.getElementById("pin-modal");
   const pinInputEl = document.getElementById("pin-input");
   const btnSubmitPin = document.getElementById("btn-submit-pin");
+  const previewModalEl = document.getElementById("preview-modal");
+  const previewBodyEl = document.getElementById("preview-body");
 
-  // Init
+  // Init: listeners bind once; auth + data loading can re-run after PIN entry
   init();
 
   async function init() {
-    setupEventListeners();
+    if (!listenersBound) {
+      setupEventListeners();
+      listenersBound = true;
+    }
     await checkAuthAndLoadInfo();
     connectWebSocket();
     loadFiles();
@@ -89,7 +96,10 @@
       if (res.ok) {
         pinModalEl.style.display = "none";
         showToast("身份验证成功", "success");
-        init();
+        await checkAuthAndLoadInfo();
+        loadFiles();
+      } else if (res.status === 429) {
+        showToast("尝试过于频繁，请 30 秒后再试", "error");
       } else {
         showToast("PIN 码错误，请重新输入", "error");
         pinInputEl.value = "";
@@ -101,6 +111,14 @@
 
   // WebSocket Connection
   function connectWebSocket() {
+    // Replace any existing socket: its stale onclose must not schedule retries
+    if (ws) {
+      ws.onclose = null;
+      ws.onmessage = null;
+      ws.onerror = null;
+      try { ws.close(); } catch (e) { /* already closing */ }
+    }
+
     const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
     const wsUrl = `${protocol}//${window.location.host}/api/ws`;
 
@@ -140,11 +158,16 @@
       renderTextFeed();
       if (msg.data.sender !== deviceName) {
         showToast(`收到来自 ${msg.data.sender} 的新文本`, "info");
+        notifyUser(`📨 来自 ${msg.data.sender} 的新文本`, truncate(msg.data.content, 60));
       }
     } else if (msg.type === "new_file") {
-      fileList.unshift(msg.data);
-      renderFileList();
-      showToast(`新文件到达: ${msg.data.name}`, "success");
+      // Skip if the file is already rendered (the uploader's own refresh)
+      if (!fileList.some((f) => f.name === msg.data.name)) {
+        fileList.unshift(msg.data);
+        renderFileList();
+        showToast(`新文件到达: ${msg.data.name}`, "success");
+        notifyUser(`📁 新文件到达`, msg.data.name);
+      }
     } else if (msg.type === "file_deleted") {
       fileList = fileList.filter((f) => f.name !== msg.filename);
       renderFileList();
@@ -234,16 +257,32 @@
     }
   }
 
-  // File Upload & Chunking Engine
+  // File Upload: parallel chunk engine with resume support
   async function handleFiles(files) {
     for (const file of files) {
       await uploadFileInChunks(file);
     }
   }
 
+  function fileSignature(file) {
+    return `${file.name}_${file.size}_${file.lastModified}`;
+  }
+
   async function uploadFileInChunks(file) {
-    const fileID = `${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
-    const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
+    const totalChunks = Math.max(1, Math.ceil(file.size / CHUNK_SIZE));
+    const sig = fileSignature(file);
+
+    // Resume: reuse the previous file_id for the same file so already-uploaded
+    // chunks can be skipped (survives page refresh via localStorage)
+    let fileID = localStorage.getItem("landrop_upload_" + sig);
+    if (fileID) {
+      const check = await fetch(`/api/upload/status?file_id=${encodeURIComponent(fileID)}`).catch(() => null);
+      if (!check || !check.ok) fileID = null;
+    }
+    if (!fileID) {
+      fileID = `${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+      localStorage.setItem("landrop_upload_" + sig, fileID);
+    }
 
     // Create progress bar card
     const progressCard = document.createElement("div");
@@ -269,9 +308,37 @@
 
     const startTime = Date.now();
     let uploadedBytes = 0;
+    let failed = false;
+
+    const updateProgress = () => {
+      const percent = Math.round((uploadedBytes / file.size) * 100);
+      fillEl.style.width = `${percent}%`;
+      pctEl.textContent = `${percent}%`;
+      const elapsedSec = (Date.now() - startTime) / 1000;
+      if (elapsedSec > 0) {
+        speedEl.textContent = `${formatBytes(uploadedBytes / elapsedSec)}/s`;
+      }
+    };
 
     try {
+      // Ask the server which chunks already exist (resume path)
+      let existing = new Set();
+      const statusRes = await fetch(`/api/upload/status?file_id=${encodeURIComponent(fileID)}`);
+      if (statusRes.ok) {
+        const data = await statusRes.json();
+        (data.chunks || []).forEach((i) => existing.add(i));
+        existing.forEach((i) => {
+          if (i < totalChunks) uploadedBytes += Math.min(CHUNK_SIZE, file.size - i * CHUNK_SIZE);
+        });
+        updateProgress();
+      }
+
+      const pending = [];
       for (let i = 0; i < totalChunks; i++) {
+        if (!existing.has(i)) pending.push(i);
+      }
+
+      const uploadChunk = async (i) => {
         const start = i * CHUNK_SIZE;
         const end = Math.min(start + CHUNK_SIZE, file.size);
         const chunkBlob = file.slice(start, end);
@@ -288,21 +355,29 @@
           method: "POST",
           body: formData,
         });
-
-        if (!res.ok) throw new Error("Chunk upload failed");
-
+        if (!res.ok) throw new Error(`Chunk ${i} upload failed`);
         uploadedBytes += chunkBlob.size;
-        const percent = Math.round((uploadedBytes / file.size) * 100);
-        fillEl.style.width = `${percent}%`;
-        pctEl.textContent = `${percent}%`;
+        updateProgress();
+      };
 
-        // Calculate speed
-        const elapsedSec = (Date.now() - startTime) / 1000;
-        if (elapsedSec > 0) {
-          const speed = uploadedBytes / elapsedSec;
-          speedEl.textContent = `${formatBytes(speed)}/s`;
+      // Worker pool: several chunks in flight for real throughput
+      let next = 0;
+      const worker = async () => {
+        while (next < pending.length && !failed) {
+          const i = pending[next++];
+          try {
+            await uploadChunk(i);
+          } catch (err) {
+            failed = true;
+            throw err;
+          }
         }
-      }
+      };
+      const workers = [];
+      for (let w = 0; w < Math.min(PARALLEL_CHUNKS, pending.length); w++) workers.push(worker());
+      await Promise.all(workers);
+
+      if (failed) throw new Error("分片上传失败，已暂停（重新选择文件可断点续传）");
 
       // Complete merge
       speedEl.textContent = "正在合并落地...";
@@ -318,6 +393,7 @@
 
       if (!completeRes.ok) throw new Error("Merge failed");
 
+      localStorage.removeItem("landrop_upload_" + sig);
       speedEl.textContent = "上传完成!";
       setTimeout(() => progressCard.remove(), 2500);
       loadFiles();
@@ -340,6 +416,10 @@
     }
   }
 
+  function isPreviewable(name) {
+    return /\.(png|jpe?g|gif|webp|bmp|svg|mp4|webm|mov|m4v|mp3|wav|ogg|m4a)$/i.test(name);
+  }
+
   function renderFileList() {
     fileCountEl.textContent = `${fileList.length} 个`;
     fileListEl.innerHTML = "";
@@ -354,6 +434,8 @@
       card.className = "file-card";
 
       const timeStr = new Date(file.mod_time).toLocaleString();
+      const safeURL = escapeHTML(file.url || "");
+      const previewable = isPreviewable(file.name);
 
       card.innerHTML = `
         <div class="file-info-group">
@@ -364,7 +446,12 @@
           </div>
         </div>
         <div class="file-actions">
-          <a href="${file.url}" download="${escapeHTML(file.name)}" class="btn-primary btn-sm" style="text-decoration:none;">
+          ${previewable ? `
+          <button class="btn-secondary btn-sm btn-preview" title="预览">
+            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"></path><circle cx="12" cy="12" r="3"></circle></svg>
+            预览
+          </button>` : ""}
+          <a href="${safeURL}" download="${escapeHTML(file.name)}" class="btn-primary btn-sm" style="text-decoration:none;">
             <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="7 10 12 15 17 10"></polyline><line x1="12" y1="15" x2="12" y2="3"></line></svg>
             下载
           </a>
@@ -374,9 +461,32 @@
         </div>
       `;
 
+      const previewBtn = card.querySelector(".btn-preview");
+      if (previewBtn) previewBtn.addEventListener("click", () => openPreview(file));
       card.querySelector(".btn-del").addEventListener("click", () => deleteFile(file.name));
       fileListEl.appendChild(card);
     });
+  }
+
+  // Media preview overlay (images / video / audio served inline)
+  function openPreview(file) {
+    const url = `${file.url}?inline=1`;
+    const name = escapeHTML(file.name);
+    let media = "";
+    if (/\.(png|jpe?g|gif|webp|bmp|svg)$/i.test(file.name)) {
+      media = `<img src="${escapeHTML(url)}" alt="${name}">`;
+    } else if (/\.(mp4|webm|mov|m4v)$/i.test(file.name)) {
+      media = `<video src="${escapeHTML(url)}" controls autoplay></video>`;
+    } else {
+      media = `<audio src="${escapeHTML(url)}" controls autoplay></audio>`;
+    }
+    previewBodyEl.innerHTML = `<div class="preview-title">${name}</div>${media}`;
+    previewModalEl.style.display = "flex";
+  }
+
+  function closePreview() {
+    previewModalEl.style.display = "none";
+    previewBodyEl.innerHTML = ""; // stop media playback
   }
 
   async function deleteFile(fileName) {
@@ -397,6 +507,21 @@
     }
   }
 
+  // Desktop notifications (only fire when the tab is in the background)
+  function notifyUser(title, body) {
+    if (document.hidden && "Notification" in window && Notification.permission === "granted") {
+      try {
+        new Notification(title, { body, icon: "/favicon.svg" });
+      } catch (e) { /* some browsers restrict notification constructors */ }
+    }
+  }
+
+  function requestNotifyPermission() {
+    if ("Notification" in window && Notification.permission === "default") {
+      Notification.requestPermission();
+    }
+  }
+
   // Toast UI
   function showToast(text, type = "info") {
     const toast = document.createElement("div");
@@ -408,7 +533,7 @@
     setTimeout(() => toast.remove(), 3500);
   }
 
-  // Event Listeners
+  // Event Listeners (bound exactly once)
   function setupEventListeners() {
     btnSendText.addEventListener("click", () => sendText(textInputEl.value));
     btnClearText.addEventListener("click", () => (textInputEl.value = ""));
@@ -466,20 +591,55 @@
         handleFiles(Array.from(e.dataTransfer.files));
       }
     });
+
+    // Clipboard screenshot paste: image goes straight to file transfer
+    document.addEventListener("paste", (e) => {
+      const items = e.clipboardData && e.clipboardData.items;
+      if (!items) return;
+      for (const item of items) {
+        if (item.type && item.type.startsWith("image/")) {
+          const blob = item.getAsFile();
+          if (!blob) continue;
+          const ext = (item.type.split("/")[1] || "png").replace("jpeg", "jpg");
+          const ts = new Date().toISOString().replace(/[-:T]/g, "").slice(0, 14);
+          const file = new File([blob], `剪贴板图片_${ts}.${ext}`, { type: item.type });
+          showToast("检测到剪贴板图片，开始传输...", "info");
+          handleFiles([file]);
+          return;
+        }
+      }
+    });
+
+    // Preview modal close
+    if (previewModalEl) {
+      previewModalEl.addEventListener("click", closePreview);
+      document.addEventListener("keydown", (e) => {
+        if (e.key === "Escape") closePreview();
+      });
+    }
+
+    // Ask for notification permission after the first interaction
+    document.addEventListener("click", requestNotifyPermission, { once: true });
   }
 
   // Utilities
   function formatBytes(bytes) {
+    bytes = Number(bytes) || 0;
     if (bytes === 0) return "0 B";
     const k = 1024;
     const sizes = ["B", "KB", "MB", "GB", "TB"];
-    const i = Math.floor(Math.log(bytes) / Math.log(k));
+    const i = Math.min(Math.floor(Math.log(bytes) / Math.log(k)), sizes.length - 1);
     return parseFloat((bytes / Math.pow(k, i)).toFixed(1)) + " " + sizes[i];
+  }
+
+  function truncate(str, n) {
+    if (!str) return "";
+    return str.length > n ? str.slice(0, n) + "…" : str;
   }
 
   function escapeHTML(str) {
     if (!str) return "";
-    return str.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+    return String(str).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
   }
 
   function escapeAndFormatUrls(str) {

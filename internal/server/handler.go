@@ -1,16 +1,24 @@
 package server
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
+	"io/fs"
+	"net"
 	"net/http"
 	"os"
+	"path"
 	"strings"
 	"time"
 )
 
+const sessionCookieName = "landrop_session"
+
 type Server struct {
-	cfg *Config
-	hub *WSHub
+	cfg   *Config
+	hub   *WSHub
+	etags map[string]string // static path -> strong ETag
 }
 
 func NewServer(cfg *Config) *Server {
@@ -18,9 +26,35 @@ func NewServer(cfg *Config) *Server {
 	go hub.Run()
 
 	return &Server{
-		cfg: cfg,
-		hub: hub,
+		cfg:   cfg,
+		hub:   hub,
+		etags: buildStaticETags(cfg.StaticFS),
 	}
+}
+
+// Shutdown stops the WebSocket hub and closes all live client connections.
+func (s *Server) Shutdown() {
+	s.hub.Shutdown()
+}
+
+// buildStaticETags precomputes strong ETags for the embedded assets so browsers
+// can revalidate cheaply (the embedded FS has no modtime for weak validators).
+func buildStaticETags(fsys fs.FS) map[string]string {
+	etags := make(map[string]string)
+	for _, name := range []string{"index.html", "app.js", "style.css"} {
+		data, err := fs.ReadFile(fsys, name)
+		if err != nil {
+			continue
+		}
+		sum := sha256.Sum256(data)
+		etag := `"` + hex.EncodeToString(sum[:8]) + `"`
+		etags["/"+name] = etag
+		if name == "index.html" {
+			etags["/"] = etag
+			etags["/index.html"] = etag
+		}
+	}
+	return etags
 }
 
 func (s *Server) Handler() http.Handler {
@@ -34,6 +68,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/auth", s.handleAuth)
 	mux.HandleFunc("/api/upload/chunk", s.handleUploadChunk)
 	mux.HandleFunc("/api/upload/complete", s.handleCompleteUpload)
+	mux.HandleFunc("/api/upload/status", s.handleUploadStatus)
 	mux.HandleFunc("/api/files", s.handleListFiles)
 	mux.HandleFunc("/api/files/delete", s.handleDeleteFile)
 	mux.HandleFunc("/api/download/", s.handleDownload)
@@ -43,16 +78,27 @@ func (s *Server) Handler() http.Handler {
 	// Static Web assets
 	fileServer := http.FileServer(http.FS(s.cfg.StaticFS))
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		// PIN cookie check for browser page load if URL has ?pin=
+		// A valid ?pin= on the page URL (QR scan flow) mints a session cookie
 		pinParam := r.URL.Query().Get("pin")
-		if pinParam != "" && pinParam == s.cfg.PIN {
+		if pinParam != "" && s.cfg.CheckPIN(pinParam) {
 			http.SetCookie(w, &http.Cookie{
-				Name:     "landrop_pin",
-				Value:    pinParam,
+				Name:     sessionCookieName,
+				Value:    s.cfg.CreateSession(),
 				Path:     "/",
-				HttpOnly: false,
-				MaxAge:   86400 * 7,
+				HttpOnly: true,
+				SameSite: http.SameSiteLaxMode,
+				MaxAge:   int(sessionTTL.Seconds()),
 			})
+		}
+
+		// Cheap revalidation for embedded assets
+		if etag, ok := s.etags[path.Clean(r.URL.Path)]; ok && (r.Method == http.MethodGet || r.Method == http.MethodHead) {
+			w.Header().Set("Cache-Control", "no-cache")
+			w.Header().Set("ETag", etag)
+			if strings.Contains(r.Header.Get("If-None-Match"), etag) {
+				w.WriteHeader(http.StatusNotModified)
+				return
+			}
 		}
 		fileServer.ServeHTTP(w, r)
 	})
@@ -63,38 +109,50 @@ func (s *Server) Handler() http.Handler {
 func (s *Server) authMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Static assets and auth verification skip PIN block
-		path := r.URL.Path
-		if path == "/api/auth" || path == "/api/info" || strings.HasPrefix(path, "/style.css") || strings.HasPrefix(path, "/app.js") {
+		p := r.URL.Path
+		if p == "/api/auth" || p == "/api/info" || p == "/style.css" || p == "/app.js" || p == "/" {
 			next.ServeHTTP(w, r)
 			return
 		}
 
-		// Check PIN from query, header, or cookie
+		// 1) Session cookie (set after PIN auth or QR-scan ?pin=)
+		if cookie, err := r.Cookie(sessionCookieName); err == nil && s.cfg.ValidSession(cookie.Value) {
+			next.ServeHTTP(w, r)
+			return
+		}
+
+		// 2) PIN via query string (QR code / API scripts) or X-PIN header
 		pin := r.URL.Query().Get("pin")
 		if pin == "" {
 			pin = r.Header.Get("X-PIN")
 		}
-		if pin == "" {
-			if cookie, err := r.Cookie("landrop_pin"); err == nil {
-				pin = cookie.Value
-			}
+		if s.cfg.CheckPIN(pin) {
+			next.ServeHTTP(w, r)
+			return
 		}
 
-		// If PIN required and invalid, for API return 401, for root HTML allow loading to show PIN prompt UI
-		if s.cfg.PIN != "" && pin != s.cfg.PIN {
-			if strings.HasPrefix(path, "/api/") {
-				w.Header().Set("Content-Type", "application/json")
-				w.WriteHeader(http.StatusUnauthorized)
-				_ = json.NewEncoder(w).Encode(map[string]interface{}{
-					"status":  "unauthorized",
-					"message": "PIN required or invalid",
-				})
-				return
-			}
+		// Not authorized: JSON 401 for API paths, serve the page for "/" so the
+		// PIN prompt UI can load.
+		if strings.HasPrefix(p, "/api/") {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusUnauthorized)
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{
+				"status":  "unauthorized",
+				"message": "PIN required or invalid",
+			})
+			return
 		}
-
 		next.ServeHTTP(w, r)
 	})
+}
+
+// clientIP extracts the host part of RemoteAddr for rate limiting.
+func clientIP(r *http.Request) string {
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return r.RemoteAddr
+	}
+	return host
 }
 
 func (s *Server) handleInfo(w http.ResponseWriter, r *http.Request) {
@@ -114,6 +172,18 @@ func (s *Server) handleAuth(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	ip := clientIP(r)
+	if s.cfg.IsAuthLocked(ip) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusTooManyRequests)
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"status":  "locked",
+			"message": "Too many failed attempts, retry in 30 seconds",
+		})
+		return
+	}
+
+	r.Body = http.MaxBytesReader(w, r.Body, 4<<10)
 	var req struct {
 		PIN string `json:"pin"`
 	}
@@ -122,7 +192,8 @@ func (s *Server) handleAuth(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if req.PIN != s.cfg.PIN {
+	if !s.cfg.CheckPIN(req.PIN) {
+		s.cfg.RecordAuthFailure(ip)
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusUnauthorized)
 		_ = json.NewEncoder(w).Encode(map[string]interface{}{
@@ -131,14 +202,16 @@ func (s *Server) handleAuth(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
+	s.cfg.ClearAuthFailures(ip)
 
-	// Set auth cookie
+	// Mint a random session token; the raw PIN never becomes the credential
 	http.SetCookie(w, &http.Cookie{
-		Name:     "landrop_pin",
-		Value:    req.PIN,
+		Name:     sessionCookieName,
+		Value:    s.cfg.CreateSession(),
 		Path:     "/",
-		HttpOnly: false,
-		MaxAge:   86400 * 7,
+		HttpOnly: true,
+		SameSite: http.SameSiteLaxMode,
+		MaxAge:   int(sessionTTL.Seconds()),
 	})
 
 	w.Header().Set("Content-Type", "application/json")
@@ -153,6 +226,7 @@ func (s *Server) handleSendText(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<20) // 1MB text cap
 	var req struct {
 		Content string `json:"content"`
 		Sender  string `json:"sender"`

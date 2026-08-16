@@ -81,7 +81,18 @@
    * 基于 RFC-6455 规范自研底层 WebSocket 握手与数据帧编解码；  
    * 服务端维护全局 Hub 组播队列与容量为 50 条的文本环形缓冲区（Ring Buffer），任何客户端发送文本即刻全网毫秒级推送，新接入设备自动同步最近历史。  
 5. **轻量会话安全 (PIN Code)**：  
-   * 启动时默认生成 4 位动态 PIN 码并拼装入二维码参数（`?pin=XXXX`），扫码设备免密进入；直接输入 IP 访问的用户需在 Web 端输入 PIN 验证通过后方可建立连接，防止公共 Wi-Fi 环境下的未授权操作。
+   * 启动时默认生成 4 位动态 PIN 码并拼装入二维码参数（`?pin=XXXX`），扫码设备免密进入；直接输入 IP 访问的用户需在 Web 端输入 PIN 验证通过后方可建立连接，防止公共 Wi-Fi 环境下的未授权操作。  
+   * **v1.1.0 强化**：PIN 比较采用常数时间算法；`/api/auth` 连续失败 5 次锁定来源 IP 30 秒；验证通过后签发随机 256 位会话令牌（Cookie），PIN 明文不再作为凭证；WebSocket 握手校验 Origin 防跨站劫持；请求体设大小上限。
+
+---
+
+## 3.3 v1.1.0 版本变更摘要
+
+* **稳定性**：WebSocket 帧长度校验（防超大/溢出帧崩溃）、读写超时 + 30s 心跳保活、Hub 优雅停机、合并失败原子回滚、中断上传临时目录 TTL 自动清扫（2 小时）。
+* **传输**：前端 4MB 分片 3 路并发上传；新增 `/api/upload/status` 断点续传（同文件指纹复用 file_id，刷新页面不丢进度）。
+* **体验**：启动自动打开浏览器；多网卡逐个输出二维码；Ctrl+V 剪贴板图片直传；图片/视频/音频页内预览（`?inline=1`）；后台标签页系统通知；文本历史落盘重启不丢；静态资源 ETag 协商缓存；Windows 旧终端 VT 转义启用。
+* **兼容**：特殊字符/中文文件名下载链接 URL 编码 + RFC 5987 `Content-Disposition`。
+* **工程**：新增单元与集成测试（`go test ./...`）；CI 增加 gofmt/vet/test 流水线；`-ldflags -X main.AppVersion` 版本注入与 `-v` 参数；Docker 多架构镜像发布至 GHCR；`run_dev_server.py` 标记弃用。
 
 ---
 
@@ -92,6 +103,7 @@
 | `/api/info` | GET | 获取服务端主机名、IP、端口及存储目录 | 无 | `{"hostname":"MacBook","host_ip":"192.168.1.5","port":8080}` |
 | `/api/auth` | POST | 提交 PIN 码完成身份鉴权 | `{"pin":"1234"}` | `{"status":"ok"}` |
 | `/api/upload/chunk` | POST | 上传单个文件分片 (Multipart) | `file_id`, `chunk_index`, `total_chunks`, `filename`, `chunk` | `{"status":"ok","chunk_index":0}` |
+| `/api/upload/status` | GET | 查询某 file_id 已到货的分片列表（断点续传） | `file_id` | `{"status":"ok","chunks":[0,1]}` |
 | `/api/upload/complete` | POST | 触发分片合并与落盘 | `{"file_id":"...","filename":"a.zip","total_chunks":5}` | `{"status":"success","file":{...}}` |
 | `/api/files` | GET | 获取当前已接收文件列表 | 无 | `{"status":"ok","files":[{...}]}` |
 | `/api/files/delete` | POST | 删除服务端指定文件 | `{"filename":"a.zip"}` | `{"status":"ok"}` |
