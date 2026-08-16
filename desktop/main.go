@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
 	"time"
 
 	"github.com/jchv/go-webview2"
@@ -22,7 +23,7 @@ import (
 
 // AppVersion is overridden at build time via
 // -ldflags "-X main.AppVersion=<version>".
-var AppVersion = "1.3.0"
+var AppVersion = "1.3.1"
 
 const (
 	defaultPort       = 8087
@@ -31,6 +32,11 @@ const (
 )
 
 func main() {
+	// Win32 windows are thread-affine: the OS thread that creates the window
+	// must be the one pumping its messages. Pin the main goroutine to the
+	// process' initial thread for the whole lifetime of the UI.
+	runtime.LockOSThread()
+
 	// 1. Network + port
 	port := network.FindAvailablePort(defaultPort)
 	lan := network.GetLANInfo()
@@ -95,18 +101,16 @@ func main() {
 	w.SetSize(1120, 780, webview2.HintNone)
 	w.Navigate(fmt.Sprintf("http://127.0.0.1:%d/?pin=%s", port, cfg.PIN))
 
-	// Block until the window is closed, or the server dies first
-	done := make(chan struct{})
+	// If the HTTP server dies, close the window from the UI thread.
 	go func() {
-		w.Run()
-		close(done)
+		if err := <-serverErr; err != nil {
+			log.Printf("server error: %v", err)
+			w.Dispatch(func() { w.Terminate() })
+		}
 	}()
 
-	select {
-	case <-done:
-	case err := <-serverErr:
-		log.Fatalf("server error: %v", err)
-	}
+	// Message loop on the main (locked) thread; blocks until window closes.
+	w.Run()
 
 	// 5. Graceful shutdown
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)

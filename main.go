@@ -23,7 +23,7 @@ import (
 
 // AppVersion is the current release version; CI overrides it at build time
 // via -ldflags "-X main.AppVersion=<version>".
-var AppVersion = "1.3.0"
+var AppVersion = "1.3.1"
 
 // maxQRCodes caps how many network interfaces get a scannable code on startup.
 const maxQRCodes = 3

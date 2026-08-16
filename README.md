@@ -190,7 +190,7 @@ lan-drop/
 
 ```bash
 # 本平台编译
-go build -ldflags="-s -w -X main.AppVersion=1.3.0" -o landrop .
+go build -ldflags="-s -w -X main.AppVersion=1.3.1" -o landrop .
 
 # Makefile 一键全平台（版本号自动注入）
 make build-all
@@ -206,7 +206,7 @@ make build-all
 
 ```bash
 cd desktop
-go build -ldflags="-s -w -H windowsgui -X main.AppVersion=1.3.0" -o LAN-Drop-Desktop.exe .
+go build -ldflags="-s -w -H windowsgui -X main.AppVersion=1.3.1" -o LAN-Drop-Desktop.exe .
 ```
 
 ### 安卓端单独编译
