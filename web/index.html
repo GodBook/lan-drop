@@ -1,0 +1,102 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <title>LAN Drop - 局域网极简跨设备快传</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <div class="container">
+    <!-- Header -->
+    <header>
+      <div class="brand">
+        <div class="logo-icon">⚡</div>
+        <div>
+          <h1>LAN Drop</h1>
+        </div>
+      </div>
+      <div class="server-info">
+        <span id="server-name">Loading...</span>
+        <div class="status-badge" id="conn-status">
+          <span class="status-dot"></span>
+          <span id="conn-text">已连接</span>
+        </div>
+      </div>
+    </header>
+
+    <!-- Main Content Grid -->
+    <div class="main-grid">
+      <!-- Left: Clipboard & Text Stream -->
+      <div class="card">
+        <div class="card-title">
+          <span>📋 文本 & 剪贴板实时流</span>
+          <span class="badge-count" id="text-count">0 条</span>
+        </div>
+
+        <div class="text-input-wrapper">
+          <textarea id="text-input" placeholder="输入或粘贴文本、链接、代码，即刻跨设备同步..."></textarea>
+          <div class="btn-group">
+            <button class="btn-primary" id="btn-send-text">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="22" y1="2" x2="11" y2="13"></line><polygon points="22 2 15 22 11 13 2 9 22 2"></polygon></svg>
+              发送文本
+            </button>
+            <button class="btn-secondary" id="btn-paste-send">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2"></path><rect x="8" y="2" width="8" height="4" rx="1" ry="1"></rect></svg>
+              粘贴并发送
+            </button>
+            <button class="btn-secondary btn-sm" id="btn-clear-text" style="margin-left: auto;">清空</button>
+          </div>
+        </div>
+
+        <div class="text-feed-list" id="text-feed-list">
+          <!-- Text items rendered here -->
+        </div>
+      </div>
+
+      <!-- Right: File Drop & Management -->
+      <div class="card">
+        <div class="card-title">
+          <span>📁 文件传输 & 接收</span>
+          <span class="badge-count" id="file-count">0 个</span>
+        </div>
+
+        <!-- Dropzone -->
+        <div class="dropzone" id="dropzone">
+          <input type="file" id="file-input" multiple style="display: none;">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
+            <polyline points="17 8 12 3 7 8"></polyline>
+            <line x1="12" y1="3" x2="12" y2="15"></line>
+          </svg>
+          <div class="drop-tip">拖拽文件到此处，或点击选择</div>
+          <div class="drop-sub">支持任意格式大文件分片秒传</div>
+        </div>
+
+        <!-- Active Upload Progress Queue -->
+        <div class="upload-queue" id="upload-queue"></div>
+
+        <!-- Downloaded File List -->
+        <div class="file-list" id="file-list">
+          <!-- File cards rendered here -->
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Toast Container -->
+  <div class="toast-container" id="toast-container"></div>
+
+  <!-- PIN Modal -->
+  <div class="modal-overlay" id="pin-modal" style="display: none;">
+    <div class="modal">
+      <h2>🔒 请输入 4 位访问 PIN 码</h2>
+      <p style="color: var(--text-muted); font-size: 13px;">请查看服务端终端屏幕上显示的 PIN 码或直接扫码免密进入</p>
+      <input type="password" id="pin-input" class="pin-input" maxlength="6" autofocus placeholder="••••">
+      <button class="btn-primary" id="btn-submit-pin" style="width: 100%;">确认进入</button>
+    </div>
+  </div>
+
+  <script src="/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,20 @@
+# Build outputs
+dist/
+*.exe
+landrop
+landrop-*
+
+# Runtime artifacts
+LAN_Drop_Files/
+.tmp_*/
+*.log
+
+# Python dev server cache
+__pycache__/
+*.pyc
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
