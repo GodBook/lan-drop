@@ -15,6 +15,8 @@
 
 | Feature | Description |
 | :--- | :--- |
+| 🖥 **Desktop app** | `LAN-Drop-Desktop-windows-x64.exe`: native WebView2 window, double-click and go, close to stop |
+| 📱 **Android app** | `landrop-android.apk`: scan or type the address, remembers recent servers |
 | 📦 **Single binary, zero deps** | All web assets embedded at compile time via `//go:embed`; nothing to install on the target machine |
 | 📱 **Scan to connect** | Renders a QR code in the terminal (one per NIC); point any phone camera at it and you're in |
 | 🧠 **Smart NIC detection** | Filters Docker / VMware / WSL / Hyper-V / VPN virtual adapters and prefers real physical LAN IPs |
@@ -32,7 +34,7 @@
 
 ## 🚀 Quick Start
 
-Grab a binary from [**Releases**](https://github.com/GodBook/lan-drop/releases) (Windows / macOS Intel & Apple Silicon / Linux x64 & arm64), or:
+Grab a build from [**Releases**](https://github.com/GodBook/lan-drop/releases): **Windows desktop app** (`LAN-Drop-Desktop-windows-x64.exe`, native window), **Android client** (`landrop-android.apk`), or CLI binaries for Windows / macOS / Linux. Alternatively:
 
 ```bash
 # Docker

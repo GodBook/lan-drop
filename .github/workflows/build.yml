@@ -90,6 +90,85 @@ jobs:
           files: dist/*
           generate_release_notes: true
 
+  desktop:
+    name: Build Windows Desktop App
+    needs: test
+    runs-on: windows-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+
+      - name: Determine version
+        id: ver
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then V="${GITHUB_REF_NAME#v}"; else V="dev-${GITHUB_SHA::7}"; fi
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+        shell: bash
+
+      - name: Build desktop app (WebView2 native window)
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          cd desktop
+          go build -ldflags "-s -w -H windowsgui -X main.AppVersion=$env:VERSION" -o ../dist/LAN-Drop-Desktop-windows-x64.exe .
+        shell: pwsh
+
+      - name: Upload Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: landrop-desktop
+          path: dist/LAN-Drop-Desktop-windows-x64.exe
+
+      - name: Attach to Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/LAN-Drop-Desktop-windows-x64.exe
+
+  android:
+    name: Build Android APK
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v3
+        with:
+          gradle-version: '8.7'
+
+      - name: Build release APK
+        run: |
+          cd android
+          gradle -p . assembleRelease --no-daemon
+
+      - name: Rename APK
+        run: cp android/app/build/outputs/apk/release/app-release.apk landrop-android.apk
+
+      - name: Upload Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: landrop-android
+          path: landrop-android.apk
+
+      - name: Attach to Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: landrop-android.apk
+
   docker:
     name: Publish Docker Image (GHCR)
     if: startsWith(github.ref, 'refs/tags/v')

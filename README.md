@@ -18,8 +18,10 @@
 
 | 特性 | 说明 |
 | :--- | :--- |
-| 📦 **单文件零依赖** | 所有 Web 资源在编译期通过 `//go:embed` 内嵌进二进制，目标机器无需安装任何运行时，下载即用 |
-| 📱 **扫码直连** | 启动后在终端渲染二维码（多网卡时逐个输出），手机系统相机 / 微信扫码即达 |
+| 🖥 **桌面应用** | Windows 端 `LAN-Drop-Desktop.exe`：原生 WebView2 窗口，双击即用、关窗即停，无终端无浏览器 |
+| 📱 **安卓应用** | `landrop-android.apk`：app 内扫码 / 输 IP 直连，记住常用服务器，支持系统文件选择器与下载管理 |
+| 📦 **单文件零依赖** | 服务端核心 100% Go 标准库；Web 资源编译期内嵌，CLI 二进制下载即用 |
+| 📱 **扫码直连** | 启动后在终端渲染二维码（仅物理网卡），手机系统相机 / 微信 / LAN Drop App 扫码即达 |
 | 🧠 **智能网卡探测** | 自动过滤 Docker / VMware / WSL / Hyper-V / VPN 等虚拟网卡，优先返回真实物理局域网 IP |
 | 🔒 **会话级安全** | 动态 4 位 PIN + 常数时间比较 + 连续失败锁定（防穷举）；登录签发随机 256 位会话令牌，PIN 明文永不出现在 Cookie；WebSocket 校验 Origin 防 CSWSH |
 | 🚀 **并发分片上传** | 前端按 4MB 分块、3 路并发流式上传，服务端临时分块落盘 + 原子合并，任意大小文件常驻内存仅 15~30MB |
@@ -39,14 +41,20 @@
 
 前往 [**Releases**](https://github.com/GodBook/lan-drop/releases) 页面，下载对应平台的可执行文件：
 
-| 平台 | 文件 |
-| :--- | :--- |
-| Windows x64 | `landrop-windows-amd64.exe` |
-| macOS Apple Silicon (M1/M2/M3/M4) | `landrop-darwin-arm64` |
-| macOS Intel | `landrop-darwin-amd64` |
-| Linux x64 / arm64 (树莓派) | `landrop-linux-amd64` / `landrop-linux-arm64` |
+| 平台 | 文件 | 说明 |
+| :--- | :--- | :--- |
+| Windows 桌面应用 | `LAN-Drop-Desktop-windows-x64.exe` | 原生窗口软件，推荐普通用户 |
+| Windows 服务端 | `landrop-windows-amd64.exe` | 命令行版（终端二维码/PIN 显示） |
+| Android | `landrop-android.apk` | 安卓客户端，安装后扫码/输 IP 直连 |
+| macOS Apple Silicon (M1/M2/M3/M4) | `landrop-darwin-arm64` | 命令行版 |
+| macOS Intel | `landrop-darwin-amd64` | 命令行版 |
+| Linux x64 / arm64 (树莓派) | `landrop-linux-amd64` / `landrop-linux-arm64` | 命令行版 |
 
-Windows 用户双击 exe（或仓库自带的 `start.bat`）；macOS / Linux 用户在终端运行：
+**Windows 用户**：普通用户直接双击 `LAN-Drop-Desktop-windows-x64.exe`——原生窗口打开即是操作界面（需要 Windows 10/11 自带的 WebView2 运行时，系统默认已内置），关闭窗口即停止服务。需要终端二维码时使用命令行版 `landrop-windows-amd64.exe`（或 `start.bat`）。
+
+**安卓用户**：下载 `landrop-android.apk` 安装（需在系统里允许"安装未知来源应用"），打开后扫码或输入 `IP:端口` 即可连接，最近用过的服务器会自动记住。
+
+**macOS / Linux 用户**（命令行版）在终端运行：
 
 ```bash
 chmod +x landrop-darwin-arm64   # 仅首次需要
@@ -155,12 +163,12 @@ go build -ldflags="-s -w" -o landrop .
 
 ```
 lan-drop/
-├── main.go                      # 进程入口：CLI 参数、多网卡二维码、自动开浏览器、优雅停机、临时目录清扫
-├── go.mod                       # 模块定义（零第三方依赖）
+├── main.go                      # CLI 服务端入口：多网卡二维码、自动开浏览器、优雅停机、临时目录清扫
+├── go.mod                       # 根模块（零第三方依赖）
 ├── Dockerfile                   # 多阶段容器构建（Alpine + 非 root）
 ├── Makefile                     # 多平台交叉编译一键脚本 (make build-all)
 ├── start.bat                    # Windows 双击启动脚本
-├── internal/
+├── core/                        # 服务端核心库（CLI 与桌面应用共用）
 │   ├── console/                 # Windows 终端 ANSI/VT 支持
 │   ├── network/ip.go            # 局域网物理网卡智能过滤、可用端口自动探测
 │   ├── qrcode/qrcode.go         # 纯 Go 实现的终端二维码编码与渲染引擎
@@ -170,17 +178,19 @@ lan-drop/
 │       ├── upload.go            # 分片接收、续传状态、原子合并回滚、Range 下载、TTL 清扫
 │       ├── ws.go                # RFC-6455 WebSocket：帧校验、心跳、Origin 检查、优雅停机
 │       └── *_test.go            # 单元测试 + httptest 集成测试
-└── web/
-    ├── index.html               # 响应式页面（移动端触控 / 桌面全屏拖拽 / PIN 弹窗 / 预览弹窗）
-    ├── app.js                   # 并发分片上传、断点续传、粘贴图片、WebSocket 通信、通知
-    └── style.css                # 深色主题、进度条、Toast 与预览组件
+├── webui/                       # 嵌入式前端资源单一来源（所有交付形态共享）
+│   └── assets/{index.html, app.js, style.css}
+├── desktop/                     # Windows 桌面应用（独立 Go 模块，WebView2 原生窗口）
+│   └── main.go                  # 启动服务 + 打开原生窗口加载本机地址，关窗优雅停机
+└── android/                     # 安卓客户端（Gradle 工程，CI 云端打包 APK）
+    └── app/                     # WebView 壳：扫码(ZXing)/手动连接/最近服务器/文件选择与下载
 ```
 
 ## 🛠️ 构建与发布
 
 ```bash
 # 本平台编译
-go build -ldflags="-s -w -X main.AppVersion=1.1.0" -o landrop .
+go build -ldflags="-s -w -X main.AppVersion=1.3.0" -o landrop .
 
 # Makefile 一键全平台（版本号自动注入）
 make build-all
@@ -189,8 +199,19 @@ make build-all
 仓库内置 **GitHub Actions** 流水线（`.github/workflows/build.yml`）：
 
 1. 每次推送先跑 **gofmt 检查 + go vet + go test -race**；
-2. 通过后编译全平台二进制并上传 Artifacts；
-3. 推送 `v*` 标签自动创建 GitHub Release 附带全部二进制，并构建 **linux/amd64 + linux/arm64** Docker 镜像发布到 GHCR。
+2. 通过后并行编译：全平台 CLI 二进制、**Windows 桌面应用**（WebView2 窗口）、**Android APK**（Gradle 签名打包）；
+3. 推送 `v*` 标签自动创建 GitHub Release 附带以上全部产物，并构建 **linux/amd64 + linux/arm64** Docker 镜像发布到 GHCR。
+
+### 桌面端单独编译
+
+```bash
+cd desktop
+go build -ldflags="-s -w -H windowsgui -X main.AppVersion=1.3.0" -o LAN-Drop-Desktop.exe .
+```
+
+### 安卓端单独编译
+
+需要 JDK 17 与 Android SDK：`cd android && gradle assembleRelease`（产物在 `app/build/outputs/apk/release/`，签名密钥已随仓库提供）。
 
 ## ❓ 常见问题
 

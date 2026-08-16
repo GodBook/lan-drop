@@ -2,10 +2,8 @@ package main
 
 import (
 	"context"
-	"embed"
 	"flag"
 	"fmt"
-	"io/fs"
 	"log"
 	"net/http"
 	"os"
@@ -16,18 +14,16 @@ import (
 	"syscall"
 	"time"
 
-	"landrop/internal/console"
-	"landrop/internal/network"
-	"landrop/internal/qrcode"
-	"landrop/internal/server"
+	"landrop/core/console"
+	"landrop/core/network"
+	"landrop/core/qrcode"
+	"landrop/core/server"
+	"landrop/webui"
 )
-
-//go:embed web/*
-var embeddedWebFS embed.FS
 
 // AppVersion is the current release version; CI overrides it at build time
 // via -ldflags "-X main.AppVersion=<version>".
-var AppVersion = "1.2.0"
+var AppVersion = "1.3.0"
 
 // maxQRCodes caps how many network interfaces get a scannable code on startup.
 const maxQRCodes = 3
@@ -89,11 +85,8 @@ func main() {
 		pin = server.GenerateRandomPIN(4)
 	}
 
-	// 5. Setup embedded web FS
-	webFS, err := fs.Sub(embeddedWebFS, "web")
-	if err != nil {
-		log.Fatalf("Failed to initialize embedded web filesystem: %v", err)
-	}
+	// 5. Setup embedded web FS (shared package, also used by the desktop app)
+	webFS := webui.Assets()
 
 	// 6. Initialize Server
 	cfg := server.NewConfig(port, primaryIP, uploadDir, pin, webFS)
