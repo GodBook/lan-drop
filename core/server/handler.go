@@ -12,6 +12,7 @@ import (
 	"path"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"landrop/core/qrcode"
@@ -20,9 +21,20 @@ import (
 const sessionCookieName = "landrop_session"
 
 type Server struct {
-	cfg   *Config
-	hub   *WSHub
-	etags map[string]string // static path -> strong ETag
+	cfg               *Config
+	hub               *WSHub
+	etags             map[string]string // static path -> strong ETag
+	uploadMu          sync.Mutex
+	uploadLocks       map[string]*uploadLock
+	uploadDirectories map[string]string
+	cancelledUploads  map[string]time.Time
+	chunkRequestSlots chan struct{}
+	uploadStateMu     sync.Mutex
+	storageMu         sync.Mutex
+	reservedStorage   int64
+	finalizeMu        sync.Mutex
+	fileIndexMu       sync.Mutex
+	fileIndexes       map[string]fileIndexCache
 }
 
 func NewServer(cfg *Config) *Server {
@@ -30,9 +42,14 @@ func NewServer(cfg *Config) *Server {
 	go hub.Run()
 
 	return &Server{
-		cfg:   cfg,
-		hub:   hub,
-		etags: buildStaticETags(cfg.StaticFS),
+		cfg:               cfg,
+		hub:               hub,
+		etags:             buildStaticETags(cfg.StaticFS),
+		uploadLocks:       make(map[string]*uploadLock),
+		uploadDirectories: make(map[string]string),
+		cancelledUploads:  make(map[string]time.Time),
+		chunkRequestSlots: make(chan struct{}, maxConcurrentChunkRequests),
+		fileIndexes:       make(map[string]fileIndexCache),
 	}
 }
 
@@ -74,6 +91,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/upload/chunk", s.handleUploadChunk)
 	mux.HandleFunc("/api/upload/complete", s.handleCompleteUpload)
 	mux.HandleFunc("/api/upload/status", s.handleUploadStatus)
+	mux.HandleFunc("/api/upload/cancel", s.handleCancelUpload)
 	mux.HandleFunc("/api/files", s.handleListFiles)
 	mux.HandleFunc("/api/files/delete", s.handleDeleteFile)
 	mux.HandleFunc("/api/download/", s.handleDownload)
@@ -83,17 +101,28 @@ func (s *Server) Handler() http.Handler {
 	// Static Web assets
 	fileServer := http.FileServer(http.FS(s.cfg.StaticFS))
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		// A valid ?pin= on the page URL (QR scan flow) mints a session cookie
-		pinParam := r.URL.Query().Get("pin")
-		if pinParam != "" && s.cfg.CheckPIN(pinParam) {
-			http.SetCookie(w, &http.Cookie{
-				Name:     sessionCookieName,
-				Value:    s.cfg.CreateSession(),
-				Path:     "/",
-				HttpOnly: true,
-				SameSite: http.SameSiteLaxMode,
-				MaxAge:   int(sessionTTL.Seconds()),
-			})
+		// QR scans carry the PIN once. Mint a session for a valid PIN, then
+		// remove the credential from browser history for both valid and invalid
+		// values. An invalid PIN lands on the normal login page after redirect.
+		query := r.URL.Query()
+		if query.Has("pin") {
+			if allowed, _ := s.checkPINAttempt(r, query.Get("pin")); allowed {
+				http.SetCookie(w, &http.Cookie{
+					Name:     sessionCookieName,
+					Value:    s.cfg.CreateSession(),
+					Path:     "/",
+					HttpOnly: true,
+					SameSite: http.SameSiteLaxMode,
+					MaxAge:   int(sessionTTL.Seconds()),
+				})
+			}
+
+			cleanURL := *r.URL
+			query.Del("pin")
+			cleanURL.RawQuery = query.Encode()
+			cleanURL.ForceQuery = false
+			http.Redirect(w, r, cleanURL.RequestURI(), http.StatusSeeOther)
+			return
 		}
 
 		// Cheap revalidation for embedded assets
@@ -108,7 +137,14 @@ func (s *Server) Handler() http.Handler {
 		fileServer.ServeHTTP(w, r)
 	})
 
-	return s.authMiddleware(mux)
+	return referrerPolicyMiddleware(s.authMiddleware(mux))
+}
+
+func referrerPolicyMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Referrer-Policy", "no-referrer")
+		next.ServeHTTP(w, r)
+	})
 }
 
 func (s *Server) authMiddleware(next http.Handler) http.Handler {
@@ -119,6 +155,10 @@ func (s *Server) authMiddleware(next http.Handler) http.Handler {
 			next.ServeHTTP(w, r)
 			return
 		}
+		if s.cfg.PIN == "" {
+			next.ServeHTTP(w, r)
+			return
+		}
 
 		// 1) Session cookie (set after PIN auth or QR-scan ?pin=)
 		if cookie, err := r.Cookie(sessionCookieName); err == nil && s.cfg.ValidSession(cookie.Value) {
@@ -126,14 +166,32 @@ func (s *Server) authMiddleware(next http.Handler) http.Handler {
 			return
 		}
 
-		// 2) PIN via query string (QR code / API scripts) or X-PIN header
-		pin := r.URL.Query().Get("pin")
-		if pin == "" {
-			pin = r.Header.Get("X-PIN")
+		// 2) PIN via query string (API scripts) or X-PIN header. Direct PIN
+		// attempts share the same lockout state as /api/auth.
+		query := r.URL.Query()
+		pin, pinProvided := query["pin"]
+		candidate := ""
+		if pinProvided && len(pin) > 0 {
+			candidate = pin[0]
+		} else if headerPIN := r.Header.Get("X-PIN"); headerPIN != "" {
+			candidate = headerPIN
+			pinProvided = true
 		}
-		if s.cfg.CheckPIN(pin) {
-			next.ServeHTTP(w, r)
-			return
+		if pinProvided {
+			allowed, locked := s.checkPINAttempt(r, candidate)
+			if allowed {
+				next.ServeHTTP(w, r)
+				return
+			}
+			if locked && strings.HasPrefix(p, "/api/") {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusTooManyRequests)
+				_ = json.NewEncoder(w).Encode(map[string]interface{}{
+					"status":  "locked",
+					"message": "Too many failed attempts, retry in 30 seconds",
+				})
+				return
+			}
 		}
 
 		// Not authorized: JSON 401 for API paths, serve the page for "/" so the
@@ -160,14 +218,18 @@ func clientIP(r *http.Request) string {
 	return host
 }
 
+func (s *Server) checkPINAttempt(r *http.Request, pin string) (allowed, locked bool) {
+	return s.cfg.CheckPINAttempt(clientIP(r), pin)
+}
+
 func (s *Server) handleInfo(w http.ResponseWriter, r *http.Request) {
 	hostname, _ := os.Hostname()
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]interface{}{
 		"hostname":   hostname,
-		"host_ip":    s.cfg.HostIP,
+		"host_ip":    s.cfg.HostIP(),
 		"port":       s.cfg.Port,
-		"upload_dir": s.cfg.UploadDir,
+		"upload_dir": s.cfg.UploadDir(),
 	})
 }
 
@@ -175,7 +237,7 @@ func (s *Server) handleInfo(w http.ResponseWriter, r *http.Request) {
 func (s *Server) connectURL() string {
 	u := url.URL{
 		Scheme: "http",
-		Host:   net.JoinHostPort(s.cfg.HostIP, strconv.Itoa(s.cfg.Port)),
+		Host:   net.JoinHostPort(s.cfg.HostIP(), strconv.Itoa(s.cfg.Port)),
 		Path:   "/",
 	}
 	if s.cfg.PIN != "" {
@@ -225,17 +287,6 @@ func (s *Server) handleAuth(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ip := clientIP(r)
-	if s.cfg.IsAuthLocked(ip) {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusTooManyRequests)
-		_ = json.NewEncoder(w).Encode(map[string]interface{}{
-			"status":  "locked",
-			"message": "Too many failed attempts, retry in 30 seconds",
-		})
-		return
-	}
-
 	r.Body = http.MaxBytesReader(w, r.Body, 4<<10)
 	var req struct {
 		PIN string `json:"pin"`
@@ -245,17 +296,24 @@ func (s *Server) handleAuth(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if !s.cfg.CheckPIN(req.PIN) {
-		s.cfg.RecordAuthFailure(ip)
+	allowed, locked := s.checkPINAttempt(r, req.PIN)
+	if !allowed {
 		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusUnauthorized)
+		status := http.StatusUnauthorized
+		responseStatus := "error"
+		message := "Invalid PIN"
+		if locked {
+			status = http.StatusTooManyRequests
+			responseStatus = "locked"
+			message = "Too many failed attempts, retry in 30 seconds"
+		}
+		w.WriteHeader(status)
 		_ = json.NewEncoder(w).Encode(map[string]interface{}{
-			"status":  "error",
-			"message": "Invalid PIN",
+			"status":  responseStatus,
+			"message": message,
 		})
 		return
 	}
-	s.cfg.ClearAuthFailures(ip)
 
 	// Mint a random session token; the raw PIN never becomes the credential
 	http.SetCookie(w, &http.Cookie{

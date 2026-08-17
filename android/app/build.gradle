@@ -3,6 +3,18 @@ plugins {
     id 'org.jetbrains.kotlin.android'
 }
 
+def releaseSigningEnv = [
+    keystorePath: System.getenv('LANDROP_KEYSTORE_PATH'),
+    storePassword: System.getenv('LANDROP_KEYSTORE_PASSWORD'),
+    keyAlias: System.getenv('LANDROP_KEY_ALIAS'),
+    keyPassword: System.getenv('LANDROP_KEY_PASSWORD')
+]
+def configuredSigningValues = releaseSigningEnv.values().count { it != null && !it.isBlank() }
+def hasReleaseSigning = configuredSigningValues == releaseSigningEnv.size()
+def releaseTaskRequested = gradle.startParameter.taskNames.any {
+    it.toLowerCase(Locale.ROOT).contains('release')
+}
+
 android {
     namespace 'com.godbook.landrop'
     compileSdk 34
@@ -11,26 +23,27 @@ android {
         applicationId "com.godbook.landrop"
         minSdk 24
         targetSdk 34
-        versionCode 5
-        versionName "1.4.0"
+        versionCode 6
+        versionName "1.5.0"
     }
 
-    // Stable release signing so APK updates install over previous versions.
-    // The keystore is committed on purpose: LAN Drop is a local network tool,
-    // not a store-distributed app, and losing the key would force uninstalls.
     signingConfigs {
-        release {
-            storeFile file('landrop.keystore')
-            storePassword 'landrop123'
-            keyAlias 'landrop'
-            keyPassword 'landrop123'
+        if (hasReleaseSigning) {
+            release {
+                storeFile file(releaseSigningEnv.keystorePath)
+                storePassword releaseSigningEnv.storePassword
+                keyAlias releaseSigningEnv.keyAlias
+                keyPassword releaseSigningEnv.keyPassword
+            }
         }
     }
 
     buildTypes {
         release {
             minifyEnabled false
-            signingConfig signingConfigs.release
+            if (hasReleaseSigning) {
+                signingConfig signingConfigs.release
+            }
         }
     }
 
@@ -43,8 +56,19 @@ android {
     }
 }
 
+if (configuredSigningValues > 0 && !hasReleaseSigning) {
+    throw new GradleException('Android release signing is only partially configured. Set LANDROP_KEYSTORE_PATH, LANDROP_KEYSTORE_PASSWORD, LANDROP_KEY_ALIAS and LANDROP_KEY_PASSWORD together.')
+}
+if (releaseTaskRequested && !hasReleaseSigning) {
+    throw new GradleException('Android release builds require signing credentials from the LANDROP_KEYSTORE_* and LANDROP_KEY_* environment variables.')
+}
+if (hasReleaseSigning && !file(releaseSigningEnv.keystorePath).isFile()) {
+    throw new GradleException("Android release keystore does not exist: ${releaseSigningEnv.keystorePath}")
+}
+
 dependencies {
     implementation 'androidx.appcompat:appcompat:1.7.0'
     implementation 'com.google.android.material:material:1.12.0'
     implementation 'com.journeyapps:zxing-android-embedded:4.3.0'
+    testImplementation 'junit:junit:4.13.2'
 }

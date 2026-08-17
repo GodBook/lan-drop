@@ -10,16 +10,25 @@ import (
 // addresses are reachable from other devices (phones); Virtual ones belong to
 // WSL / Hyper-V / container stacks and are shown as text reference only.
 type LANInfo struct {
-	Physical []string
-	Virtual  []string
+	Physical         []string
+	Virtual          []string
+	PhysicalAdapters []AdapterAddress
+}
+
+// AdapterAddress keeps the user-visible interface name alongside its IPv4
+// address so desktop clients can offer an explicit adapter choice.
+type AdapterAddress struct {
+	Name string `json:"name"`
+	IP   string `json:"ip"`
 }
 
 // GetLANInfo returns private IPv4 addresses grouped by adapter kind, with
 // standard private ranges prioritized.
 func GetLANInfo() LANInfo {
 	info := LANInfo{
-		Physical: []string{},
-		Virtual:  []string{},
+		Physical:         []string{},
+		Virtual:          []string{},
+		PhysicalAdapters: []AdapterAddress{},
 	}
 
 	interfaces, err := net.Interfaces()
@@ -86,6 +95,7 @@ func GetLANInfo() LANInfo {
 					info.Virtual = append(info.Virtual, ipStr)
 				} else {
 					info.Physical = append(info.Physical, ipStr)
+					info.PhysicalAdapters = append(info.PhysicalAdapters, AdapterAddress{Name: iface.Name, IP: ipStr})
 				}
 			}
 		}

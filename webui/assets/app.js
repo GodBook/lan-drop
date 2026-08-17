@@ -2,6 +2,10 @@
 (function () {
   const CHUNK_SIZE = 4 * 1024 * 1024; // 4MB per chunk
   const PARALLEL_CHUNKS = 3;          // concurrent chunk uploads per file
+  const CHUNK_RETRY_LIMIT = 3;
+  const RETRY_BASE_DELAY = 600;
+  const WS_RETRY_MAX_DELAY = 30000;
+  const FILE_PAGE_SIZE = 20;
 
   // State
   let ws = null;
@@ -10,6 +14,17 @@
   let fileList = [];
   let deviceName = getOrCreateDeviceName();
   let listenersBound = false; // guard: register DOM listeners exactly once
+  let wsReconnectTimer = null;
+  let wsRetryAttempt = 0;
+  let wsGeneration = 0;
+  let filePage = 1;
+  let fileTotal = 0;
+  let fileQuery = "";
+  let fileType = "all";
+  let fileLoadSequence = 0;
+  let searchDebounceTimer = null;
+  const selectedFiles = new Set();
+  const uploadTasks = new Map();
 
   // DOM Elements
   const serverNameEl = document.getElementById("server-name");
@@ -26,6 +41,13 @@
   const uploadQueueEl = document.getElementById("upload-queue");
   const fileListEl = document.getElementById("file-list");
   const fileCountEl = document.getElementById("file-count");
+  const fileSearchEl = document.getElementById("file-search");
+  const fileTypeFilterEl = document.getElementById("file-type-filter");
+  const fileSelectAllEl = document.getElementById("file-select-all");
+  const btnDeleteSelectedEl = document.getElementById("btn-delete-selected");
+  const btnPrevPageEl = document.getElementById("btn-prev-page");
+  const btnNextPageEl = document.getElementById("btn-next-page");
+  const pageStatusEl = document.getElementById("page-status");
   const toastContainerEl = document.getElementById("toast-container");
   const pinModalEl = document.getElementById("pin-modal");
   const pinInputEl = document.getElementById("pin-input");
@@ -41,6 +63,16 @@
   const qrPINHintEl = document.getElementById("qr-pin-hint");
   const btnCloseQREl = document.getElementById("btn-close-qr");
   const btnCopyQRURLEl = document.getElementById("btn-copy-qr-url");
+  const desktopActionsEl = document.getElementById("desktop-actions");
+  const btnDesktopOpenFolderEl = document.getElementById("btn-desktop-open-folder");
+  const btnDesktopCopyAddressEl = document.getElementById("btn-desktop-copy-address");
+  const btnDesktopSettingsEl = document.getElementById("btn-desktop-settings");
+  const desktopSettingsModalEl = document.getElementById("desktop-settings-modal");
+  const btnCloseDesktopSettingsEl = document.getElementById("btn-close-desktop-settings");
+  const desktopAdapterSelectEl = document.getElementById("desktop-adapter-select");
+  const desktopUploadDirEl = document.getElementById("desktop-upload-dir");
+  const desktopConnectURLEl = document.getElementById("desktop-connect-url");
+  const btnDesktopChangeFolderEl = document.getElementById("btn-desktop-change-folder");
   let qrImageObjectURL = "";
   let qrPreviousFocus = null;
   let qrRequestID = 0;
@@ -49,12 +81,17 @@
   init();
 
   async function init() {
+    removeSensitiveURLParameters();
     if (!listenersBound) {
       setupEventListeners();
       listenersBound = true;
     }
     if (isLoopbackHost(window.location.hostname)) {
       btnShowQREl.hidden = false;
+    }
+    if (window.__LANDROP_DESKTOP__) {
+      desktopActionsEl.hidden = false;
+      refreshDesktopSettings();
     }
     await checkAuthAndLoadInfo();
     connectWebSocket();
@@ -86,7 +123,7 @@
       // whether a PIN is required so the modal can actually appear.
       const [infoRes, probeRes] = await Promise.all([
         fetch("/api/info"),
-        fetch("/api/files"),
+        fetch("/api/files?page=1&page_size=1"),
       ]);
       if (infoRes.ok) {
         const data = await infoRes.json();
@@ -118,6 +155,8 @@
         pinModalEl.style.display = "none";
         showToast("身份验证成功", "success");
         await checkAuthAndLoadInfo();
+        wsRetryAttempt = 0;
+        connectWebSocket();
         loadFiles();
       } else if (res.status === 429) {
         showToast("尝试过于频繁，请 30 秒后再试", "error");
@@ -132,7 +171,14 @@
 
   // WebSocket Connection
   function connectWebSocket() {
-    // Replace any existing socket: its stale onclose must not schedule retries
+    clearTimeout(wsReconnectTimer);
+    wsReconnectTimer = null;
+    if (!navigator.onLine) {
+      setConnectionState("offline");
+      return;
+    }
+
+    const generation = ++wsGeneration;
     if (ws) {
       ws.onclose = null;
       ws.onmessage = null;
@@ -140,34 +186,62 @@
       try { ws.close(); } catch (e) { /* already closing */ }
     }
 
+    setConnectionState("connecting");
     const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
-    const wsUrl = `${protocol}//${window.location.host}/api/ws`;
-
-    ws = new WebSocket(wsUrl);
+    ws = new WebSocket(`${protocol}//${window.location.host}/api/ws`);
 
     ws.onopen = () => {
+      if (generation !== wsGeneration) return;
       wsConnected = true;
-      connStatusEl.style.color = "var(--success)";
-      connStatusEl.style.background = "rgba(16, 185, 129, 0.1)";
-      connTextEl.textContent = "已连接";
+      wsRetryAttempt = 0;
+      setConnectionState("connected");
     };
 
     ws.onmessage = (event) => {
+      if (generation !== wsGeneration) return;
       try {
-        const msg = JSON.parse(event.data);
-        handleWSMessage(msg);
+        handleWSMessage(JSON.parse(event.data));
       } catch (e) {
         console.error("WS Parse error", e);
       }
     };
 
-    ws.onclose = () => {
-      wsConnected = false;
-      connStatusEl.style.color = "var(--danger)";
-      connStatusEl.style.background = "rgba(239, 68, 68, 0.1)";
-      connTextEl.textContent = "重连中...";
-      setTimeout(connectWebSocket, 2000);
+    ws.onerror = () => {
+      if (generation === wsGeneration) setConnectionState("connecting");
     };
+
+    ws.onclose = () => {
+      if (generation !== wsGeneration) return;
+      wsConnected = false;
+      ws = null;
+      scheduleWebSocketReconnect();
+    };
+  }
+
+  function scheduleWebSocketReconnect() {
+    clearTimeout(wsReconnectTimer);
+    if (!navigator.onLine) {
+      setConnectionState("offline");
+      return;
+    }
+    const base = Math.min(1000 * Math.pow(2, wsRetryAttempt), WS_RETRY_MAX_DELAY);
+    const delay = Math.round(base * (1 + Math.random() * 0.3));
+    wsRetryAttempt += 1;
+    setConnectionState("connecting", Math.max(1, Math.ceil(delay / 1000)));
+    wsReconnectTimer = setTimeout(connectWebSocket, delay);
+  }
+
+  function setConnectionState(state, retrySeconds) {
+    const states = {
+      connected: ["var(--success)", "rgba(16, 185, 129, 0.1)", "已连接"],
+      connecting: ["var(--warning)", "rgba(245, 158, 11, 0.12)", retrySeconds ? `${retrySeconds} 秒后重连` : "连接中..."],
+      offline: ["var(--danger)", "rgba(239, 68, 68, 0.1)", "网络已离线"],
+    };
+    const value = states[state] || states.connecting;
+    connStatusEl.style.color = value[0];
+    connStatusEl.style.background = value[1];
+    connStatusEl.querySelector(".status-dot").style.background = value[0];
+    connTextEl.textContent = value[2];
   }
 
   function handleWSMessage(msg) {
@@ -182,16 +256,12 @@
         notifyUser(`📨 来自 ${msg.data.sender} 的新文本`, truncate(msg.data.content, 60));
       }
     } else if (msg.type === "new_file") {
-      // Skip if the file is already rendered (the uploader's own refresh)
-      if (!fileList.some((f) => f.name === msg.data.name)) {
-        fileList.unshift(msg.data);
-        renderFileList();
-        showToast(`新文件到达: ${msg.data.name}`, "success");
-        notifyUser(`📁 新文件到达`, msg.data.name);
-      }
+      loadFiles();
+      showToast(`新文件到达: ${msg.data.name}`, "success");
+      notifyUser("新文件到达", msg.data.name);
     } else if (msg.type === "file_deleted") {
-      fileList = fileList.filter((f) => f.name !== msg.filename);
-      renderFileList();
+      selectedFiles.delete(msg.filename);
+      loadFiles();
     }
   }
 
@@ -279,22 +349,23 @@
   }
 
   // File Upload: parallel chunk engine with resume support
-  async function handleFiles(files) {
-    for (const file of files) {
-      await uploadFileInChunks(file);
-    }
+  function handleFiles(files) {
+    files.forEach((file) => createUploadTask(file));
   }
 
   function fileSignature(file) {
     return `${file.name}_${file.size}_${file.lastModified}`;
   }
 
-  async function uploadFileInChunks(file) {
+  async function createUploadTask(file) {
     const totalChunks = Math.max(1, Math.ceil(file.size / CHUNK_SIZE));
     const sig = fileSignature(file);
 
-    // Resume: reuse the previous file_id for the same file so already-uploaded
-    // chunks can be skipped (survives page refresh via localStorage)
+    if (Array.from(uploadTasks.values()).some((task) => task.sig === sig && !["cancelled", "done"].includes(task.state))) {
+      showToast(`“${file.name}”已在传输队列中`, "info");
+      return;
+    }
+
     let fileID = localStorage.getItem("landrop_upload_" + sig);
     if (fileID) {
       const check = await fetch(`/api/upload/status?file_id=${encodeURIComponent(fileID)}`).catch(() => null);
@@ -305,13 +376,21 @@
       localStorage.setItem("landrop_upload_" + sig, fileID);
     }
 
-    // Create progress bar card
     const progressCard = document.createElement("div");
     progressCard.className = "progress-item";
     progressCard.innerHTML = `
       <div class="progress-info">
         <span class="file-name">${escapeHTML(file.name)}</span>
-        <span class="progress-pct">0%</span>
+        <div class="upload-actions">
+          <span class="progress-pct">0%</span>
+          <button class="icon-button btn-upload-toggle" type="button" title="暂停" aria-label="暂停上传">
+            <svg class="icon-pause" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M8 5v14M16 5v14"></path></svg>
+            <svg class="icon-play" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true" hidden><path d="m7 4 13 8-13 8z"></path></svg>
+          </button>
+          <button class="icon-button btn-upload-cancel" type="button" title="取消" aria-label="取消上传">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M18 6 6 18M6 6l12 12"></path></svg>
+          </button>
+        </div>
       </div>
       <div class="progress-bar-bg">
         <div class="progress-bar-fill"></div>
@@ -326,111 +405,245 @@
     const fillEl = progressCard.querySelector(".progress-bar-fill");
     const pctEl = progressCard.querySelector(".progress-pct");
     const speedEl = progressCard.querySelector(".speed");
-
-    const startTime = Date.now();
-    let uploadedBytes = 0;
-    let failed = false;
-
-    const updateProgress = () => {
-      const percent = Math.round((uploadedBytes / file.size) * 100);
-      fillEl.style.width = `${percent}%`;
-      pctEl.textContent = `${percent}%`;
-      const elapsedSec = (Date.now() - startTime) / 1000;
-      if (elapsedSec > 0) {
-        speedEl.textContent = `${formatBytes(uploadedBytes / elapsedSec)}/s`;
-      }
+    const task = {
+      file,
+      fileID,
+      sig,
+      totalChunks,
+      state: "running",
+      runToken: 0,
+      uploadedBytes: 0,
+      startedAt: Date.now(),
+      completedChunks: new Set(),
+      controllers: new Set(),
+      card: progressCard,
+      fillEl,
+      pctEl,
+      speedEl,
+      toggleEl: progressCard.querySelector(".btn-upload-toggle"),
+      cancelEl: progressCard.querySelector(".btn-upload-cancel"),
     };
+    uploadTasks.set(fileID, task);
+    task.toggleEl.addEventListener("click", () => {
+      if (task.state === "running") pauseUpload(task);
+      else if (task.state === "paused" || task.state === "failed") resumeUpload(task);
+    });
+    task.cancelEl.addEventListener("click", () => cancelUpload(task));
+    updateUploadTaskUI(task);
+    runUploadTask(task);
+  }
 
+  function updateUploadTaskUI(task) {
+    const denominator = Math.max(task.file.size, 1);
+    const percent = task.file.size === 0 && task.completedChunks.size > 0
+      ? 100
+      : Math.min(100, Math.round((task.uploadedBytes / denominator) * 100));
+    task.fillEl.style.width = `${percent}%`;
+    task.pctEl.textContent = `${percent}%`;
+    const pauseIcon = task.toggleEl.querySelector(".icon-pause");
+    const playIcon = task.toggleEl.querySelector(".icon-play");
+    const canStart = task.state === "paused" || task.state === "failed";
+    const finalizing = task.state === "finalizing";
+    pauseIcon.hidden = canStart;
+    playIcon.hidden = !canStart;
+    task.toggleEl.disabled = finalizing || task.state === "done";
+    task.cancelEl.disabled = finalizing || task.state === "done";
+    task.toggleEl.title = finalizing ? "正在完成" : task.state === "failed" ? "重试" : canStart ? "继续" : "暂停";
+    task.toggleEl.setAttribute("aria-label", `${task.toggleEl.title}上传`);
+    task.card.dataset.state = task.state;
+    if (task.state === "running") {
+      const elapsedSec = Math.max((Date.now() - task.startedAt) / 1000, 0.1);
+      task.speedEl.style.color = "";
+      task.speedEl.textContent = task.uploadedBytes > 0 ? `${formatBytes(task.uploadedBytes / elapsedSec)}/s` : "准备传输...";
+    }
+  }
+
+  function pauseUpload(task) {
+    if (task.state !== "running") return;
+    task.state = "paused";
+    task.runToken += 1;
+    abortTaskRequests(task);
+    task.speedEl.textContent = "已暂停";
+    updateUploadTaskUI(task);
+  }
+
+  function resumeUpload(task) {
+    if (task.state !== "paused" && task.state !== "failed") return;
+    const wasFailed = task.state === "failed";
+    task.state = "running";
+    task.startedAt = Date.now();
+    task.speedEl.textContent = wasFailed ? "正在重试..." : "正在继续...";
+    updateUploadTaskUI(task);
+    runUploadTask(task);
+  }
+
+  async function cancelUpload(task) {
+    if (task.state === "cancelled" || task.state === "done" || task.state === "finalizing") return;
+    task.state = "cancelled";
+    task.runToken += 1;
+    abortTaskRequests(task);
+    localStorage.removeItem("landrop_upload_" + task.sig);
+    uploadTasks.delete(task.fileID);
+    task.card.remove();
     try {
-      // Ask the server which chunks already exist (resume path)
-      let existing = new Set();
-      const statusRes = await fetch(`/api/upload/status?file_id=${encodeURIComponent(fileID)}`);
-      if (statusRes.ok) {
-        const data = await statusRes.json();
-        (data.chunks || []).forEach((i) => existing.add(i));
-        existing.forEach((i) => {
-          if (i < totalChunks) uploadedBytes += Math.min(CHUNK_SIZE, file.size - i * CHUNK_SIZE);
-        });
-        updateProgress();
-      }
+      await fetch("/api/upload/cancel", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ file_id: task.fileID }),
+      });
+    } catch (e) { /* stale chunks are also removed by the server sweeper */ }
+    showToast(`已取消“${task.file.name}”`, "info");
+  }
+
+  function abortTaskRequests(task) {
+    task.controllers.forEach((controller) => controller.abort());
+    task.controllers.clear();
+  }
+
+  async function runUploadTask(task) {
+    const token = ++task.runToken;
+    try {
+      const statusRes = await fetch(`/api/upload/status?file_id=${encodeURIComponent(task.fileID)}`);
+      if (!statusRes.ok) throw new Error("无法读取续传状态");
+      const status = await statusRes.json();
+      if (token !== task.runToken || task.state !== "running") return;
+
+      task.completedChunks = new Set((status.chunks || []).filter((i) => Number.isInteger(i) && i >= 0 && i < task.totalChunks));
+      task.uploadedBytes = 0;
+      task.completedChunks.forEach((i) => {
+        task.uploadedBytes += Math.max(0, Math.min(CHUNK_SIZE, task.file.size - i * CHUNK_SIZE));
+      });
+      updateUploadTaskUI(task);
 
       const pending = [];
-      for (let i = 0; i < totalChunks; i++) {
-        if (!existing.has(i)) pending.push(i);
+      for (let i = 0; i < task.totalChunks; i++) {
+        if (!task.completedChunks.has(i)) pending.push(i);
       }
 
-      const uploadChunk = async (i) => {
-        const start = i * CHUNK_SIZE;
-        const end = Math.min(start + CHUNK_SIZE, file.size);
-        const chunkBlob = file.slice(start, end);
-
-        const formData = new FormData();
-        formData.append("file_id", fileID);
-        formData.append("chunk_index", i.toString());
-        formData.append("total_chunks", totalChunks.toString());
-        formData.append("filename", file.name);
-        formData.append("file_size", file.size.toString());
-        formData.append("chunk", chunkBlob);
-
-        const res = await fetch("/api/upload/chunk", {
-          method: "POST",
-          body: formData,
-        });
-        if (!res.ok) throw new Error(`Chunk ${i} upload failed`);
-        uploadedBytes += chunkBlob.size;
-        updateProgress();
-      };
-
-      // Worker pool: several chunks in flight for real throughput
       let next = 0;
       const worker = async () => {
-        while (next < pending.length && !failed) {
-          const i = pending[next++];
-          try {
-            await uploadChunk(i);
-          } catch (err) {
-            failed = true;
-            throw err;
-          }
+        while (next < pending.length && token === task.runToken && task.state === "running") {
+          const index = pending[next++];
+          await uploadChunkWithRetry(task, index, token);
         }
       };
-      const workers = [];
-      for (let w = 0; w < Math.min(PARALLEL_CHUNKS, pending.length); w++) workers.push(worker());
+      const workers = Array.from(
+        { length: Math.min(PARALLEL_CHUNKS, pending.length) },
+        () => worker()
+      );
       await Promise.all(workers);
+      if (token !== task.runToken || task.state !== "running") return;
 
-      if (failed) throw new Error("分片上传失败，已暂停（重新选择文件可断点续传）");
-
-      // Complete merge
-      speedEl.textContent = "正在合并落地...";
+      task.state = "finalizing";
+      task.speedEl.textContent = "正在合并落地，请稍候...";
+      updateUploadTaskUI(task);
       const completeRes = await fetch("/api/upload/complete", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          file_id: fileID,
-          filename: file.name,
-          total_chunks: totalChunks,
+          file_id: task.fileID,
+          filename: task.file.name,
+          total_chunks: task.totalChunks,
+          file_size: task.file.size,
         }),
       });
+      if (!completeRes.ok) throw new Error(await responseError(completeRes, "文件合并失败"));
+      if (token !== task.runToken || task.state !== "finalizing") return;
 
-      if (!completeRes.ok) throw new Error("Merge failed");
-
-      localStorage.removeItem("landrop_upload_" + sig);
-      speedEl.textContent = "上传完成!";
-      setTimeout(() => progressCard.remove(), 2500);
+      task.state = "done";
+      task.uploadedBytes = Math.max(task.file.size, 1);
+      localStorage.removeItem("landrop_upload_" + task.sig);
+      updateUploadTaskUI(task);
+      task.speedEl.textContent = "上传完成";
+      setTimeout(() => {
+        uploadTasks.delete(task.fileID);
+        task.card.remove();
+      }, 2500);
       loadFiles();
     } catch (err) {
-      speedEl.textContent = `上传中断: ${err.message}`;
-      speedEl.style.color = "var(--danger)";
+      if (token !== task.runToken || task.state === "paused" || task.state === "cancelled" || err.name === "AbortError") return;
+      task.state = "failed";
+      abortTaskRequests(task);
+      task.speedEl.textContent = `上传中断: ${err.message}`;
+      task.speedEl.style.color = "var(--danger)";
+      updateUploadTaskUI(task);
     }
   }
 
+  async function uploadChunkWithRetry(task, index, token) {
+    const start = index * CHUNK_SIZE;
+    const end = Math.min(start + CHUNK_SIZE, task.file.size);
+    const chunkBlob = task.file.slice(start, end);
+
+    for (let attempt = 0; attempt <= CHUNK_RETRY_LIMIT; attempt++) {
+      if (token !== task.runToken || task.state !== "running") throw new DOMException("上传已停止", "AbortError");
+      const controller = new AbortController();
+      task.controllers.add(controller);
+      try {
+        const formData = new FormData();
+        formData.append("file_id", task.fileID);
+        formData.append("chunk_index", index.toString());
+        formData.append("total_chunks", task.totalChunks.toString());
+        formData.append("filename", task.file.name);
+        formData.append("file_size", task.file.size.toString());
+        formData.append("chunk", chunkBlob);
+        const res = await fetch("/api/upload/chunk", { method: "POST", body: formData, signal: controller.signal });
+        if (!res.ok) {
+          const message = await responseError(res, `分片 ${index + 1} 上传失败`);
+          const error = new Error(message);
+          error.nonRetryable = [400, 409, 413, 507].includes(res.status);
+          throw error;
+        }
+        if (!task.completedChunks.has(index)) {
+          task.completedChunks.add(index);
+          task.uploadedBytes += chunkBlob.size;
+          updateUploadTaskUI(task);
+        }
+        return;
+      } catch (err) {
+        if (err.name === "AbortError" || err.nonRetryable || attempt === CHUNK_RETRY_LIMIT) throw err;
+        const wait = RETRY_BASE_DELAY * Math.pow(2, attempt) * (1 + Math.random() * 0.25);
+        task.speedEl.textContent = `分片重试 ${attempt + 1}/${CHUNK_RETRY_LIMIT}...`;
+        await delay(wait);
+      } finally {
+        task.controllers.delete(controller);
+      }
+    };
+  }
+
   // File List & Management
+  function applyFileFilters() {
+    // Read the controls together so a type change cannot issue a request with
+    // a search term that is still waiting for its debounce timer.
+    fileQuery = fileSearchEl.value.trim();
+    fileType = fileTypeFilterEl.value;
+    filePage = 1;
+    loadFiles();
+  }
+
   async function loadFiles() {
+    const sequence = ++fileLoadSequence;
     try {
-      const res = await fetch("/api/files");
+      const params = new URLSearchParams({
+        page: String(filePage),
+        page_size: String(FILE_PAGE_SIZE),
+        type: fileType,
+      });
+      if (fileQuery) params.set("q", fileQuery);
+      const res = await fetch(`/api/files?${params.toString()}`);
       if (!res.ok) return;
       const data = await res.json();
+      if (sequence !== fileLoadSequence) return;
       fileList = data.files || [];
+      fileTotal = Number.isFinite(Number(data.total)) ? Number(data.total) : fileList.length;
+      filePage = Number.isFinite(Number(data.page)) ? Math.max(1, Number(data.page)) : filePage;
+      const maxPage = Math.max(1, Math.ceil(fileTotal / FILE_PAGE_SIZE));
+      if (filePage > maxPage) {
+        filePage = maxPage;
+        loadFiles();
+        return;
+      }
+      selectedFiles.clear();
       renderFileList();
     } catch (e) {
       console.error("Load files error", e);
@@ -442,11 +655,16 @@
   }
 
   function renderFileList() {
-    fileCountEl.textContent = `${fileList.length} 个`;
+    const totalPages = Math.max(1, Math.ceil(fileTotal / FILE_PAGE_SIZE));
+    fileCountEl.textContent = `${fileTotal} 个`;
+    pageStatusEl.textContent = `第 ${filePage} / ${totalPages} 页`;
+    btnPrevPageEl.disabled = filePage <= 1;
+    btnNextPageEl.disabled = filePage >= totalPages;
     fileListEl.innerHTML = "";
 
     if (fileList.length === 0) {
-      fileListEl.innerHTML = `<div style="text-align:center; color:var(--text-muted); padding:20px; font-size:13px;">暂无已传输文件</div>`;
+      fileListEl.innerHTML = `<div class="empty-state">${fileQuery || fileType !== "all" ? "没有符合条件的文件" : "暂无已传输文件"}</div>`;
+      updateBatchControls();
       return;
     }
 
@@ -459,6 +677,9 @@
       const previewable = isPreviewable(file.name);
 
       card.innerHTML = `
+        <label class="file-select" title="选择 ${escapeHTML(file.name)}">
+          <input type="checkbox" class="file-checkbox" aria-label="选择 ${escapeHTML(file.name)}">
+        </label>
         <div class="file-info-group">
           <div class="file-icon">📄</div>
           <div class="file-details">
@@ -485,8 +706,26 @@
       const previewBtn = card.querySelector(".btn-preview");
       if (previewBtn) previewBtn.addEventListener("click", () => openPreview(file));
       card.querySelector(".btn-del").addEventListener("click", () => deleteFile(file.name));
+      const checkbox = card.querySelector(".file-checkbox");
+      checkbox.checked = selectedFiles.has(file.name);
+      checkbox.addEventListener("change", () => {
+        if (checkbox.checked) selectedFiles.add(file.name);
+        else selectedFiles.delete(file.name);
+        card.classList.toggle("selected", checkbox.checked);
+        updateBatchControls();
+      });
+      card.classList.toggle("selected", checkbox.checked);
       fileListEl.appendChild(card);
     });
+    updateBatchControls();
+  }
+
+  function updateBatchControls() {
+    const allSelected = fileList.length > 0 && fileList.every((file) => selectedFiles.has(file.name));
+    fileSelectAllEl.checked = allSelected;
+    fileSelectAllEl.indeterminate = !allSelected && selectedFiles.size > 0;
+    btnDeleteSelectedEl.disabled = selectedFiles.size === 0;
+    btnDeleteSelectedEl.lastChild.textContent = selectedFiles.size > 0 ? ` 删除所选 (${selectedFiles.size})` : " 删除所选";
   }
 
   // Media preview overlay (images / video / audio served inline)
@@ -562,18 +801,99 @@
     }
   }
 
+  async function refreshDesktopSettings() {
+    if (typeof window.desktopGetSettings !== "function") return;
+    try {
+      const info = await window.desktopGetSettings();
+      desktopAdapterSelectEl.innerHTML = "";
+      (info.adapters || []).forEach((adapter) => {
+        const option = document.createElement("option");
+        option.value = adapter.ip;
+        option.textContent = `${adapter.name || "局域网网卡"} (${adapter.ip})`;
+        option.selected = adapter.ip === info.selected_ip;
+        desktopAdapterSelectEl.appendChild(option);
+      });
+      desktopUploadDirEl.textContent = info.upload_dir || "";
+      desktopConnectURLEl.textContent = info.connect_url || "";
+    } catch (err) {
+      console.error("Desktop bridge error", err);
+    }
+  }
+
+  async function openDesktopSettings() {
+    if (!window.__LANDROP_DESKTOP__) return;
+    await refreshDesktopSettings();
+    desktopSettingsModalEl.style.display = "flex";
+    desktopAdapterSelectEl.focus();
+  }
+
+  function closeDesktopSettings() {
+    desktopSettingsModalEl.style.display = "none";
+  }
+
+  async function selectDesktopAdapter() {
+    if (typeof window.desktopSetAdapter !== "function") return;
+    desktopAdapterSelectEl.disabled = true;
+    try {
+      await window.desktopSetAdapter(desktopAdapterSelectEl.value);
+      await Promise.all([refreshDesktopSettings(), checkAuthAndLoadInfo()]);
+      showToast("连接网卡已切换", "success");
+    } catch (err) {
+      showToast("切换网卡失败: " + err.message, "error");
+    } finally {
+      desktopAdapterSelectEl.disabled = false;
+    }
+  }
+
+  async function chooseDesktopUploadDirectory() {
+    if (typeof window.desktopChooseUploadDir !== "function") return;
+    btnDesktopChangeFolderEl.disabled = true;
+    try {
+      await window.desktopChooseUploadDir();
+      await Promise.all([refreshDesktopSettings(), checkAuthAndLoadInfo(), loadFiles()]);
+    } catch (err) {
+      showToast("更改目录失败: " + err.message, "error");
+    } finally {
+      btnDesktopChangeFolderEl.disabled = false;
+    }
+  }
+
+  async function callDesktopAction(name, successText) {
+    const action = window[name];
+    if (typeof action !== "function") return;
+    try {
+      await action();
+      if (successText) showToast(successText, "success");
+    } catch (err) {
+      showToast(err.message || "桌面操作失败", "error");
+    }
+  }
+
   async function deleteFile(fileName) {
     if (!confirm(`确定在服务端删除文件 "${fileName}" 吗？`)) return;
+    await deleteFiles([fileName]);
+  }
+
+  async function deleteSelectedFiles() {
+    const names = Array.from(selectedFiles);
+    if (names.length === 0) return;
+    if (!confirm(`确定在服务端删除所选的 ${names.length} 个文件吗？此操作无法撤销。`)) return;
+    await deleteFiles(names);
+  }
+
+  async function deleteFiles(names) {
     try {
       const res = await fetch("/api/files/delete", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ filename: fileName }),
+        body: JSON.stringify(names.length === 1 ? { filename: names[0] } : { filenames: names }),
       });
       if (res.ok) {
-        showToast("文件已删除", "info");
-        fileList = fileList.filter((f) => f.name !== fileName);
-        renderFileList();
+        names.forEach((name) => selectedFiles.delete(name));
+        showToast(names.length === 1 ? "文件已删除" : `已删除 ${names.length} 个文件`, "info");
+        await loadFiles();
+      } else {
+        throw new Error(await responseError(res, "删除请求被拒绝"));
       }
     } catch (e) {
       showToast("删除失败: " + e.message, "error");
@@ -644,6 +964,37 @@
       }
     });
 
+    fileSearchEl.addEventListener("input", () => {
+      clearTimeout(searchDebounceTimer);
+      searchDebounceTimer = setTimeout(() => {
+        searchDebounceTimer = null;
+        applyFileFilters();
+      }, 250);
+    });
+    fileTypeFilterEl.addEventListener("change", () => {
+      clearTimeout(searchDebounceTimer);
+      searchDebounceTimer = null;
+      applyFileFilters();
+    });
+    fileSelectAllEl.addEventListener("change", () => {
+      fileList.forEach((file) => {
+        if (fileSelectAllEl.checked) selectedFiles.add(file.name);
+        else selectedFiles.delete(file.name);
+      });
+      renderFileList();
+    });
+    btnDeleteSelectedEl.addEventListener("click", deleteSelectedFiles);
+    btnPrevPageEl.addEventListener("click", () => {
+      if (filePage <= 1) return;
+      filePage -= 1;
+      loadFiles();
+    });
+    btnNextPageEl.addEventListener("click", () => {
+      if (filePage >= Math.max(1, Math.ceil(fileTotal / FILE_PAGE_SIZE))) return;
+      filePage += 1;
+      loadFiles();
+    });
+
     ["dragenter", "dragover"].forEach((eventName) => {
       document.body.addEventListener(eventName, (e) => {
         e.preventDefault();
@@ -701,11 +1052,66 @@
       if (e.key === "Escape" && qrModalEl.style.display !== "none") closeQRModal();
     });
 
+    btnDesktopOpenFolderEl.addEventListener("click", () => callDesktopAction("desktopOpenUploadDir"));
+    btnDesktopCopyAddressEl.addEventListener("click", () => callDesktopAction("desktopCopyConnectionAddress", "连接地址已复制"));
+    btnDesktopSettingsEl.addEventListener("click", openDesktopSettings);
+    btnCloseDesktopSettingsEl.addEventListener("click", closeDesktopSettings);
+    btnDesktopChangeFolderEl.addEventListener("click", chooseDesktopUploadDirectory);
+    desktopAdapterSelectEl.addEventListener("change", selectDesktopAdapter);
+    desktopSettingsModalEl.addEventListener("click", (event) => {
+      if (event.target === desktopSettingsModalEl) closeDesktopSettings();
+    });
+    window.addEventListener("landrop:open-desktop-settings", openDesktopSettings);
+    window.addEventListener("landrop:desktop-settings-changed", async () => {
+      await Promise.all([refreshDesktopSettings(), checkAuthAndLoadInfo(), loadFiles()]);
+    });
+    document.addEventListener("keydown", (event) => {
+      if (event.key === "Escape" && desktopSettingsModalEl.style.display !== "none") closeDesktopSettings();
+    });
+
+    window.addEventListener("online", () => {
+      wsRetryAttempt = 0;
+      connectWebSocket();
+      loadFiles();
+    });
+    window.addEventListener("offline", () => {
+      clearTimeout(wsReconnectTimer);
+      wsGeneration += 1;
+      wsConnected = false;
+      if (ws) {
+        ws.onclose = null;
+        try { ws.close(); } catch (e) { /* already closed */ }
+        ws = null;
+      }
+      setConnectionState("offline");
+    });
+
     // Ask for notification permission after the first interaction
     document.addEventListener("click", requestNotifyPermission, { once: true });
   }
 
   // Utilities
+  function removeSensitiveURLParameters() {
+    const current = new URL(window.location.href);
+    if (!current.searchParams.has("pin")) return;
+    current.searchParams.delete("pin");
+    const clean = current.pathname + (current.searchParams.toString() ? `?${current.searchParams.toString()}` : "") + current.hash;
+    window.history.replaceState(null, document.title, clean);
+  }
+
+  function delay(ms) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+  }
+
+  async function responseError(response, fallback) {
+    try {
+      const text = (await response.text()).trim();
+      return text || `${fallback} (${response.status})`;
+    } catch (e) {
+      return `${fallback} (${response.status})`;
+    }
+  }
+
   function formatBytes(bytes) {
     bytes = Number(bytes) || 0;
     if (bytes === 0) return "0 B";

@@ -149,13 +149,61 @@ jobs:
         with:
           gradle-version: '8.7'
 
-      - name: Build release APK
+      - name: Restore Android release signing key
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          LANDROP_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          LANDROP_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          LANDROP_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          LANDROP_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
         run: |
-          cd android
-          gradle -p . assembleRelease --no-daemon
+          missing=0
+          for name in LANDROP_KEYSTORE_BASE64 LANDROP_KEYSTORE_PASSWORD LANDROP_KEY_ALIAS LANDROP_KEY_PASSWORD; do
+            if [ -z "${!name}" ]; then
+              echo "::error::$name is not configured in GitHub Actions secrets"
+              missing=1
+            fi
+          done
+          if [ "$missing" -ne 0 ]; then exit 1; fi
+
+          keystore_path="$RUNNER_TEMP/landrop-release.keystore"
+          umask 077
+          if ! printf '%s' "$LANDROP_KEYSTORE_BASE64" | base64 --decode > "$keystore_path"; then
+            echo "::error::ANDROID_KEYSTORE_BASE64 is not valid base64"
+            rm -f "$keystore_path"
+            exit 1
+          fi
+          if [ ! -s "$keystore_path" ]; then
+            echo "::error::Decoded Android keystore is empty"
+            rm -f "$keystore_path"
+            exit 1
+          fi
+          echo "LANDROP_KEYSTORE_PATH=$keystore_path" >> "$GITHUB_ENV"
+
+      - name: Test and build debug APK
+        if: ${{ !startsWith(github.ref, 'refs/tags/v') }}
+        run: gradle -p android testDebugUnitTest assembleDebug --no-daemon
+
+      - name: Test and build signed release APK
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          LANDROP_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          LANDROP_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          LANDROP_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: gradle -p android testDebugUnitTest assembleRelease --no-daemon
+
+      - name: Remove temporary Android signing key
+        if: always()
+        run: rm -f "$RUNNER_TEMP/landrop-release.keystore"
 
       - name: Rename APK
-        run: cp android/app/build/outputs/apk/release/app-release.apk landrop-android.apk
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            cp android/app/build/outputs/apk/release/app-release.apk landrop-android.apk
+          else
+            cp android/app/build/outputs/apk/debug/app-debug.apk landrop-android.apk
+          fi
+        shell: bash
 
       - name: Upload Artifacts
         uses: actions/upload-artifact@v4

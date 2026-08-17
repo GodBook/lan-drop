@@ -5,11 +5,14 @@ import (
 	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io/fs"
 	"math/big"
+	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 )
@@ -45,11 +48,13 @@ type authFailState struct {
 
 // Config holds runtime configuration and in-memory states
 type Config struct {
-	Port      int
-	HostIP    string
-	UploadDir string
-	PIN       string
-	StaticFS  fs.FS
+	Port     int
+	PIN      string
+	StaticFS fs.FS
+
+	runtimeMu sync.RWMutex
+	hostIP    string
+	uploadDir string
 
 	mu         sync.RWMutex
 	TextFeed   []TextMessage
@@ -77,10 +82,10 @@ func NewConfig(port int, hostIP, uploadDir, pin string, staticFS fs.FS) *Config 
 	// generate a random one (see GenerateRandomPIN).
 	cfg := &Config{
 		Port:       port,
-		HostIP:     hostIP,
-		UploadDir:  uploadDir,
 		PIN:        pin,
 		StaticFS:   staticFS,
+		hostIP:     hostIP,
+		uploadDir:  uploadDir,
 		TextFeed:   make([]TextMessage, 0),
 		MaxFeedLen: 50,
 		feedPath:   filepath.Join(uploadDir, feedStoreFileName),
@@ -91,6 +96,58 @@ func NewConfig(port int, hostIP, uploadDir, pin string, staticFS fs.FS) *Config 
 	return cfg
 }
 
+// HostIP returns the currently advertised LAN address.
+func (c *Config) HostIP() string {
+	c.runtimeMu.RLock()
+	defer c.runtimeMu.RUnlock()
+	return c.hostIP
+}
+
+// SetHostIP changes the address used by connection links and discovery.
+func (c *Config) SetHostIP(ip string) error {
+	parsed := net.ParseIP(ip)
+	if parsed == nil || parsed.To4() == nil {
+		return fmt.Errorf("invalid IPv4 address %q", ip)
+	}
+	c.runtimeMu.Lock()
+	c.hostIP = parsed.To4().String()
+	c.runtimeMu.Unlock()
+	return nil
+}
+
+// UploadDir returns the directory currently used for received files.
+func (c *Config) UploadDir() string {
+	c.runtimeMu.RLock()
+	defer c.runtimeMu.RUnlock()
+	return c.uploadDir
+}
+
+// SetUploadDir switches future file operations to dir and loads that
+// directory's text feed. Existing in-flight requests keep their local path.
+func (c *Config) SetUploadDir(dir string) error {
+	if strings.TrimSpace(dir) == "" {
+		return errors.New("upload directory cannot be empty")
+	}
+	abs, err := filepath.Abs(dir)
+	if err != nil {
+		return fmt.Errorf("resolve upload directory: %w", err)
+	}
+	if err := os.MkdirAll(abs, 0755); err != nil {
+		return fmt.Errorf("create upload directory: %w", err)
+	}
+
+	c.runtimeMu.Lock()
+	c.uploadDir = abs
+	c.runtimeMu.Unlock()
+
+	c.mu.Lock()
+	c.feedPath = filepath.Join(abs, feedStoreFileName)
+	c.TextFeed = make([]TextMessage, 0)
+	c.loadFeedFromDiskLocked()
+	c.mu.Unlock()
+	return nil
+}
+
 // CheckPIN compares a candidate PIN in constant time. An empty configured PIN
 // means authentication is disabled and everything passes.
 func (c *Config) CheckPIN(input string) bool {
@@ -98,6 +155,40 @@ func (c *Config) CheckPIN(input string) bool {
 		return true
 	}
 	return subtle.ConstantTimeCompare([]byte(input), []byte(c.PIN)) == 1
+}
+
+// CheckPINAttempt atomically applies the per-IP lockout policy and verifies a
+// candidate PIN. Keeping the whole decision under authMu prevents concurrent
+// requests from passing the lock check before their failures are recorded.
+func (c *Config) CheckPINAttempt(ip, input string) (allowed, locked bool) {
+	if c.PIN == "" {
+		return true, false
+	}
+
+	c.authMu.Lock()
+	defer c.authMu.Unlock()
+
+	now := time.Now()
+	state, exists := c.authFails[ip]
+	if exists && now.Before(state.lockedUntil) {
+		return false, true
+	}
+	if c.CheckPIN(input) {
+		delete(c.authFails, ip)
+		return true, false
+	}
+	if !exists {
+		state = &authFailState{}
+		c.authFails[ip] = state
+	}
+	state.lockedUntil = time.Time{}
+	state.count++
+	if state.count >= authMaxFailures {
+		state.count = 0
+		state.lockedUntil = now.Add(authLockDuration)
+		return false, true
+	}
+	return false, false
 }
 
 // CreateSession mints a random 256-bit session token valid for sessionTTL.
@@ -133,39 +224,6 @@ func (c *Config) ValidSession(token string) bool {
 	return ok && time.Now().Before(exp)
 }
 
-// IsAuthLocked reports whether the source IP is temporarily locked out after
-// repeated PIN failures.
-func (c *Config) IsAuthLocked(ip string) bool {
-	c.authMu.Lock()
-	defer c.authMu.Unlock()
-	st, ok := c.authFails[ip]
-	return ok && time.Now().Before(st.lockedUntil)
-}
-
-// RecordAuthFailure counts a failed attempt and locks the IP after
-// authMaxFailures consecutive failures.
-func (c *Config) RecordAuthFailure(ip string) {
-	c.authMu.Lock()
-	defer c.authMu.Unlock()
-	st, ok := c.authFails[ip]
-	if !ok {
-		st = &authFailState{}
-		c.authFails[ip] = st
-	}
-	st.count++
-	if st.count >= authMaxFailures {
-		st.lockedUntil = time.Now().Add(authLockDuration)
-		st.count = 0
-	}
-}
-
-// ClearAuthFailures resets the failure counter after a successful login.
-func (c *Config) ClearAuthFailures(ip string) {
-	c.authMu.Lock()
-	defer c.authMu.Unlock()
-	delete(c.authFails, ip)
-}
-
 func (c *Config) AddTextMessage(msg TextMessage) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -186,6 +244,12 @@ func (c *Config) GetTextFeed() []TextMessage {
 
 // loadFeedFromDisk restores the text history persisted by previous runs.
 func (c *Config) loadFeedFromDisk() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.loadFeedFromDiskLocked()
+}
+
+func (c *Config) loadFeedFromDiskLocked() {
 	data, err := os.ReadFile(c.feedPath)
 	if err != nil {
 		return

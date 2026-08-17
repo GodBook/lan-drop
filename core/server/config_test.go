@@ -56,18 +56,19 @@ func TestSessionLifecycle(t *testing.T) {
 func TestAuthRateLimit(t *testing.T) {
 	cfg := newTestConfig(t, "1234")
 	ip := "10.0.0.9"
-	for i := 0; i < authMaxFailures; i++ {
-		cfg.RecordAuthFailure(ip)
+	for i := 0; i < authMaxFailures-1; i++ {
+		if allowed, locked := cfg.CheckPINAttempt(ip, "wrong"); allowed || locked {
+			t.Fatalf("attempt %d must be rejected without locking: allowed=%v locked=%v", i+1, allowed, locked)
+		}
 	}
-	if !cfg.IsAuthLocked(ip) {
-		t.Fatal("IP should be locked after repeated failures")
+	if allowed, locked := cfg.CheckPINAttempt(ip, "wrong"); allowed || !locked {
+		t.Fatalf("final failed attempt must establish lockout: allowed=%v locked=%v", allowed, locked)
 	}
-	if cfg.IsAuthLocked("10.0.0.8") {
-		t.Fatal("unrelated IP must not be locked")
+	if allowed, locked := cfg.CheckPINAttempt(ip, "1234"); allowed || !locked {
+		t.Fatalf("locked IP must reject the correct PIN: allowed=%v locked=%v", allowed, locked)
 	}
-	cfg.ClearAuthFailures(ip)
-	if cfg.IsAuthLocked(ip) {
-		t.Fatal("lock must clear on success")
+	if allowed, locked := cfg.CheckPINAttempt("10.0.0.8", "1234"); !allowed || locked {
+		t.Fatalf("unrelated IP must remain usable: allowed=%v locked=%v", allowed, locked)
 	}
 }
 

@@ -5,6 +5,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -15,6 +16,7 @@ import (
 	"time"
 
 	"landrop/core/console"
+	"landrop/core/discovery"
 	"landrop/core/network"
 	"landrop/core/qrcode"
 	"landrop/core/server"
@@ -23,7 +25,7 @@ import (
 
 // AppVersion is the current release version; CI overrides it at build time
 // via -ldflags "-X main.AppVersion=<version>".
-var AppVersion = "1.4.0"
+var AppVersion = "1.5.0"
 
 // maxQRCodes caps how many network interfaces get a scannable code on startup.
 const maxQRCodes = 3
@@ -91,6 +93,10 @@ func main() {
 	// 6. Initialize Server
 	cfg := server.NewConfig(port, primaryIP, uploadDir, pin, webFS)
 	srv := server.NewServer(cfg)
+	mdnsAdvertiser, mdnsErr := discovery.Start(hostnameForDiscovery(), primaryIP, port, cfg.PIN != "")
+	if mdnsErr != nil {
+		log.Printf("mDNS discovery disabled: %v", mdnsErr)
+	}
 
 	baseURL := fmt.Sprintf("http://%s:%d", primaryIP, port)
 	fullURL := baseURL
@@ -149,6 +155,10 @@ func main() {
 		ReadTimeout:  30 * time.Minute, // Support long big-file chunk uploads
 		WriteTimeout: 30 * time.Minute,
 	}
+	listener, err := net.Listen("tcp4", httpServer.Addr)
+	if err != nil {
+		log.Fatalf("listen on %s: %v", httpServer.Addr, err)
+	}
 
 	// Graceful shutdown channel
 	stopChan := make(chan os.Signal, 1)
@@ -165,7 +175,7 @@ func main() {
 	}()
 
 	go func() {
-		if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		if err := httpServer.Serve(listener); err != nil && err != http.ErrServerClosed {
 			log.Fatalf("Server error: %v", err)
 		}
 	}()
@@ -187,8 +197,19 @@ func main() {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	_ = httpServer.Shutdown(ctx)
+	if mdnsAdvertiser != nil {
+		_ = mdnsAdvertiser.Close()
+	}
 	srv.Shutdown()
 	fmt.Println("已安全退出。")
+}
+
+func hostnameForDiscovery() string {
+	hostname, err := os.Hostname()
+	if err != nil || hostname == "" {
+		return "landrop"
+	}
+	return hostname
 }
 
 // openBrowser launches the default browser at url, best-effort.

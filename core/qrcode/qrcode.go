@@ -2,6 +2,7 @@ package qrcode
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"strings"
 )
@@ -15,7 +16,9 @@ func PrintTerminal(text string) string {
 	return qr.ToSmallTerminalString()
 }
 
-// ECL represents Error Correction Level
+// ECL represents an error-correction level. Encode currently accepts only
+// Medium; the other values remain defined so unsupported requests can fail
+// explicitly instead of being silently encoded with Medium parameters.
 type ECL int
 
 const (
@@ -25,20 +28,41 @@ const (
 	High
 )
 
+var (
+	// ErrUnsupportedECL is returned because this encoder intentionally supports
+	// only the Medium error-correction level.
+	ErrUnsupportedECL = errors.New("unsupported QR error-correction level")
+	// ErrDataTooLong is returned when byte-mode data does not fit in a
+	// Medium-ECL Version 1-5 QR code.
+	ErrDataTooLong = errors.New("QR data exceeds supported capacity")
+)
+
+const (
+	minSupportedVersion = 1
+	maxSupportedVersion = 5
+	maxPayloadBytes     = 84
+	supportedMask       = 0
+)
+
+var mediumByteCapacities = [...]int{0, 14, 26, 42, 62, maxPayloadBytes}
+
 // QRCode represents a generated QR Code matrix
 type QRCode struct {
 	Size    int
 	Modules [][]bool
 }
 
-// Encode generates a QRCode matrix for the given string
+// Encode generates a byte-mode QRCode matrix. The deliberately small encoder
+// supports only Medium error correction and Versions 1-5 (up to 84 bytes).
 func Encode(text string, level ECL) (*QRCode, error) {
+	if level != Medium {
+		return nil, fmt.Errorf("%w: %d (only Medium is supported)", ErrUnsupportedECL, level)
+	}
+
 	data := []byte(text)
-	// For LAN Drop URLs (approx 30-60 chars), Version 3 or 4 is sufficient.
-	// We dynamically pick the minimal version needed.
-	ver := pickVersion(len(data), level)
-	if ver > 10 {
-		ver = 10
+	ver, ok := pickVersion(len(data))
+	if !ok {
+		return nil, fmt.Errorf("%w: got %d bytes, maximum is %d", ErrDataTooLong, len(data), maxPayloadBytes)
 	}
 
 	size := 17 + 4*ver
@@ -91,6 +115,9 @@ func Encode(text string, level ECL) (*QRCode, error) {
 	bitStream := buildBitStream(data, ver, level)
 	dataCodewords := bitsToBytes(bitStream)
 	totalCapacity := totalDataCodewords(ver)
+	if len(dataCodewords) > totalCapacity {
+		return nil, fmt.Errorf("%w: %d encoded bytes do not fit Version %d", ErrDataTooLong, len(dataCodewords), ver)
+	}
 	padDataCodewords(&dataCodewords, totalCapacity)
 
 	eccBytesPerBlock, numBlocks := getEccInfo(ver, level)
@@ -108,8 +135,9 @@ func Encode(text string, level ECL) (*QRCode, error) {
 	// 7. Place data bits
 	placeDataBits(matrix, reserved, finalBits)
 
-	// 8. Masking & Best Mask Selection (default to mask pattern 0 for simplicity)
-	maskPattern := 0
+	// 8. Masking. Pattern 0 is standards-compliant and is the only mask this
+	// intentionally limited encoder emits.
+	maskPattern := supportedMask
 	applyMask(matrix, reserved, maskPattern)
 
 	// 9. Write Format Information (ECL + Mask)
@@ -216,30 +244,27 @@ func alignmentPatternPositions(ver int) []int {
 		return []int{6, 26}
 	case 5:
 		return []int{6, 30}
-	case 6:
-		return []int{6, 34}
 	default:
-		return []int{6, 6 + ver*4}
+		return nil
 	}
 }
 
-func pickVersion(dataLen int, level ECL) int {
-	capacities := []int{0, 14, 26, 42, 62, 84, 106, 122, 152, 180, 213}
-	for v := 1; v <= 10; v++ {
-		if dataLen <= capacities[v] {
-			return v
+func pickVersion(dataLen int) (int, bool) {
+	for version := minSupportedVersion; version <= maxSupportedVersion; version++ {
+		if dataLen <= mediumByteCapacities[version] {
+			return version, true
 		}
 	}
-	return 6
+	return 0, false
 }
 
 func totalDataCodewords(ver int) int {
-	// Total data codewords (excluding ECC) for Medium ECL
-	caps := []int{0, 16, 28, 44, 64, 86, 108, 124, 154, 182, 216}
-	if ver < len(caps) {
+	// Total data codewords (excluding ECC) for Medium ECL, Versions 1-5.
+	caps := []int{0, 16, 28, 44, 64, 86}
+	if ver >= minSupportedVersion && ver < len(caps) {
 		return caps[ver]
 	}
-	return 64
+	return 0
 }
 
 func getEccInfo(ver int, level ECL) (eccBytesPerBlock, numBlocks int) {
@@ -255,7 +280,7 @@ func getEccInfo(ver int, level ECL) (eccBytesPerBlock, numBlocks int) {
 	case 5:
 		return 24, 2
 	default:
-		return 18, 2
+		return 0, 0
 	}
 }
 
