@@ -31,6 +31,7 @@ android {
         if (hasReleaseSigning) {
             release {
                 storeFile file(releaseSigningEnv.keystorePath)
+                storeType 'PKCS12'
                 storePassword releaseSigningEnv.storePassword
                 keyAlias releaseSigningEnv.keyAlias
                 keyPassword releaseSigningEnv.keyPassword
