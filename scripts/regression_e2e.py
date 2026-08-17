@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""Full regression for LAN Drop v1.1.0: auth/rate-limit, WS (incl. hostile
-frames), resume upload with special filenames, feed persistence across restart."""
+"""Full LAN Drop regression: auth/rate-limit, connection QR, WS (including
+hostile frames), resumable upload, special filenames, and restart persistence."""
 import base64, json, os, shutil, socket, struct, subprocess, sys, time
 import urllib.request, urllib.error
 
@@ -85,6 +85,13 @@ st, _, hdrs = req("GET", f"/?pin={PIN}")
 check("page 200", st == 200)
 cookie = hdrs.get("Set-Cookie", "")
 check("session cookie minted via ?pin=", "landrop_session=" in cookie, cookie)
+
+st, qr_svg, qr_headers = req("GET", f"/api/qr?pin={PIN}", raw=True)
+check("connection QR SVG", st == 200 and b"<svg" in qr_svg and
+      "image/svg+xml" in qr_headers.get("Content-Type", ""))
+st, qr_details, _ = req("GET", f"/api/qr?format=json&pin={PIN}")
+check("connection QR details", st == 200 and qr_details.get("pin") == PIN and
+      qr_details.get("url", "").endswith(f":{PORT}/?pin={PIN}"), str(qr_details))
 
 st, _, _ = req("POST", "/api/auth", json.dumps({"pin": "0000"}).encode(), {"Content-Type": "application/json"})
 check("wrong pin 401", st == 401)

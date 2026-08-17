@@ -1,6 +1,7 @@
 package qrcode
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 )
@@ -54,5 +55,20 @@ func TestToSmallTerminalString(t *testing.T) {
 	// The border guarantees at least one blank column; rendering must be non-empty
 	if len(strings.TrimSpace(out)) == 0 {
 		t.Fatal("terminal rendering is empty")
+	}
+}
+
+func TestToSVGHasFourModuleQuietZone(t *testing.T) {
+	qr, err := Encode("http://192.168.1.5:8087/?pin=1234", Medium)
+	if err != nil {
+		t.Fatalf("Encode failed: %v", err)
+	}
+	svg := qr.ToSVG()
+	expectedViewBox := "viewBox=\"0 0 " + fmt.Sprint(qr.Size+8) + " " + fmt.Sprint(qr.Size+8) + "\""
+	if !strings.Contains(svg, expectedViewBox) {
+		t.Fatalf("SVG must include a four-module quiet zone: %s", expectedViewBox)
+	}
+	if !strings.Contains(svg, "<rect") || !strings.HasSuffix(svg, "</svg>") {
+		t.Fatal("SVG output is incomplete")
 	}
 }

@@ -85,6 +85,10 @@ header {
   color: var(--text-muted);
 }
 
+#server-name {
+  overflow-wrap: anywhere;
+}
+
 .status-badge {
   display: inline-flex;
   align-items: center;
@@ -217,6 +221,10 @@ button {
 .btn-sm {
   padding: 4px 10px;
   font-size: 12px;
+}
+
+.btn-qr {
+  flex-shrink: 0;
 }
 
 .btn-danger {
@@ -464,6 +472,105 @@ button {
   box-shadow: var(--shadow);
 }
 
+.qr-modal {
+  max-width: 356px;
+  gap: 18px;
+  text-align: left;
+}
+
+.qr-modal-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.qr-modal-header h2 {
+  font-size: 18px;
+  font-weight: 650;
+}
+
+.icon-button {
+  width: 34px;
+  height: 34px;
+  flex: 0 0 34px;
+  padding: 0;
+  color: var(--text-muted);
+  background: #334155;
+}
+
+.icon-button:hover {
+  color: var(--text-main);
+  background: #475569;
+}
+
+.qr-image-box {
+  width: 232px;
+  height: 232px;
+  margin: 0 auto;
+  display: grid;
+  place-items: center;
+  overflow: hidden;
+  background: #ffffff;
+  border: 1px solid #cbd5e1;
+  border-radius: 8px;
+}
+
+.qr-image-box img {
+  width: 232px;
+  height: 232px;
+  display: block;
+  image-rendering: pixelated;
+}
+
+.qr-loading {
+  padding: 20px;
+  color: #475569;
+  font-size: 13px;
+  text-align: center;
+}
+
+.qr-details {
+  min-width: 0;
+}
+
+.qr-detail-label {
+  margin-bottom: 7px;
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+.qr-address-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 34px;
+  gap: 8px;
+  align-items: stretch;
+}
+
+.qr-url {
+  min-width: 0;
+  padding: 8px 10px;
+  overflow-wrap: anywhere;
+  color: var(--text-main);
+  background: #0f172a;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  font-family: Consolas, "SFMono-Regular", monospace;
+  font-size: 11px;
+  line-height: 17px;
+}
+
+.qr-copy-button {
+  align-self: stretch;
+  height: auto;
+}
+
+.qr-pin-hint {
+  margin-top: 9px;
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
 .pin-input {
   font-size: 24px;
   letter-spacing: 8px;
@@ -521,4 +628,23 @@ button {
 .preview-body audio {
   width: 80vw;
   max-width: 480px;
+}
+
+@media (max-width: 640px) {
+  header {
+    align-items: flex-start;
+    gap: 12px;
+  }
+
+  .server-info {
+    max-width: 65%;
+    flex-wrap: wrap;
+    justify-content: flex-end;
+    gap: 8px;
+  }
+
+  #server-name {
+    width: 100%;
+    text-align: right;
+  }
 }

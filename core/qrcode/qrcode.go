@@ -3,6 +3,7 @@ package qrcode
 import (
 	"bytes"
 	"fmt"
+	"strings"
 )
 
 // PrintTerminal outputs an ANSI colored or unicode block QR code for the given text to the console.
@@ -60,8 +61,8 @@ func Encode(text string, level ECL) (*QRCode, error) {
 		setModule(matrix, reserved, i, 6, val)
 	}
 
-	// 3. Dark module
-	setModule(matrix, reserved, 8, 4*ver+9, true)
+	// 3. Dark module (x=8, y=4*version+9)
+	setModule(matrix, reserved, 4*ver+9, 8, true)
 
 	// 4. Alignment patterns if ver >= 2
 	if ver >= 2 {
@@ -476,33 +477,55 @@ func applyMask(m, res [][]bool, mask int) {
 }
 
 func writeFormatInfo(m [][]bool, level ECL, mask int) {
-	// Format Info: ECL Medium (00) + Mask 0 (000) = 00000 -> with BCH = 101010000010010 ^ 101010000010010 = 0
-	// Precomputed format bits for Medium ECL, Mask 0: 0x5412 (101010000010010)
-	formatBits := 0x5412 ^ 0x5412 // after mask = 0 (15 bits 0)
-	if mask == 0 && level == Medium {
-		formatBits = 0x5412 ^ 0x5412
+	eclBits := map[ECL]int{
+		Low:      1,
+		Medium:   0,
+		Quartile: 3,
+		High:     2,
+	}[level]
+	data := eclBits<<3 | mask
+	remainder := data
+	for i := 0; i < 10; i++ {
+		remainder = (remainder << 1) ^ ((remainder >> 9) * 0x537)
 	}
-	bits := make([]bool, 15)
-	for i := 0; i < 15; i++ {
-		bits[i] = ((formatBits >> (14 - i)) & 1) == 1
-	}
+	formatBits := (data<<10 | remainder) ^ 0x5412
+	bit := func(i int) bool { return ((formatBits >> i) & 1) != 0 }
 
 	size := len(m)
-	// Write to top-left
-	order1 := [][2]int{
-		{8, 0}, {8, 1}, {8, 2}, {8, 3}, {8, 4}, {8, 5}, {8, 7}, {8, 8},
-		{7, 8}, {5, 8}, {4, 8}, {3, 8}, {2, 8}, {1, 8}, {0, 8},
+	for i := 0; i <= 5; i++ {
+		m[i][8] = bit(i)
 	}
-	for i, pos := range order1 {
-		m[pos[0]][pos[1]] = bits[i]
+	m[7][8] = bit(6)
+	m[8][8] = bit(7)
+	m[8][7] = bit(8)
+	for i := 9; i < 15; i++ {
+		m[8][14-i] = bit(i)
 	}
 
-	// Write to split areas
-	order2 := [][2]int{
-		{size - 1, 8}, {size - 2, 8}, {size - 3, 8}, {size - 4, 8}, {size - 5, 8}, {size - 6, 8}, {size - 7, 8},
-		{8, size - 8}, {8, size - 7}, {8, size - 6}, {8, size - 5}, {8, size - 4}, {8, size - 3}, {8, size - 2}, {8, size - 1},
+	for i := 0; i < 8; i++ {
+		m[8][size-1-i] = bit(i)
 	}
-	for i, pos := range order2 {
-		m[pos[0]][pos[1]] = bits[i]
+	for i := 8; i < 15; i++ {
+		m[size-15+i][8] = bit(i)
 	}
+	m[size-8][8] = true
+}
+
+// ToSVG renders the matrix as a crisp, self-contained SVG image with a
+// standards-compliant 4-module quiet zone, suitable for serving over HTTP.
+func (qr *QRCode) ToSVG() string {
+	quiet := 4
+	size := qr.Size + quiet*2
+	var b strings.Builder
+	fmt.Fprintf(&b, `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 %d %d" shape-rendering="crispEdges">`, size, size)
+	b.WriteString(`<rect width="100%" height="100%" fill="#ffffff"/>`)
+	for y, row := range qr.Modules {
+		for x, dark := range row {
+			if dark {
+				fmt.Fprintf(&b, `<rect x="%d" y="%d" width="1" height="1" fill="#000000"/>`, x+quiet, y+quiet)
+			}
+		}
+	}
+	b.WriteString("</svg>")
+	return b.String()
 }

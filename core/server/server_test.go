@@ -113,6 +113,51 @@ func TestAuthLockout(t *testing.T) {
 	}
 }
 
+func TestConnectQRIsProtectedAndContainsLANURL(t *testing.T) {
+	_, ts, _ := newTestServer(t, "1234")
+
+	res, err := http.Get(ts.URL + "/api/qr")
+	if err != nil {
+		t.Fatal(err)
+	}
+	res.Body.Close()
+	if res.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("QR endpoint without credentials must 401, got %d", res.StatusCode)
+	}
+
+	res, err = http.Get(ts.URL + "/api/qr?pin=1234")
+	if err != nil {
+		t.Fatal(err)
+	}
+	svg, _ := io.ReadAll(res.Body)
+	res.Body.Close()
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("authorized QR request failed: %d", res.StatusCode)
+	}
+	if !strings.HasPrefix(res.Header.Get("Content-Type"), "image/svg+xml") || !bytes.Contains(svg, []byte("<svg")) {
+		t.Fatal("QR endpoint must return an SVG image")
+	}
+	if res.Header.Get("Cache-Control") != "no-store" {
+		t.Fatal("QR response must not be cached")
+	}
+
+	res, err = http.Get(ts.URL + "/api/qr?format=json&pin=1234")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var details struct {
+		URL string `json:"url"`
+		PIN string `json:"pin"`
+	}
+	if err := json.NewDecoder(res.Body).Decode(&details); err != nil {
+		t.Fatal(err)
+	}
+	res.Body.Close()
+	if details.URL != "http://127.0.0.1:18087/?pin=1234" || details.PIN != "1234" {
+		t.Fatalf("unexpected QR details: %+v", details)
+	}
+}
+
 func uploadChunk(t *testing.T, ts *httptest.Server, url, fileID string, index, total int, data []byte) {
 	t.Helper()
 	var buf bytes.Buffer

@@ -7,10 +7,14 @@ import (
 	"io/fs"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path"
+	"strconv"
 	"strings"
 	"time"
+
+	"landrop/core/qrcode"
 )
 
 const sessionCookieName = "landrop_session"
@@ -65,6 +69,7 @@ func (s *Server) Handler() http.Handler {
 
 	// API endpoints
 	mux.HandleFunc("/api/info", s.handleInfo)
+	mux.HandleFunc("/api/qr", s.handleQR)
 	mux.HandleFunc("/api/auth", s.handleAuth)
 	mux.HandleFunc("/api/upload/chunk", s.handleUploadChunk)
 	mux.HandleFunc("/api/upload/complete", s.handleCompleteUpload)
@@ -164,6 +169,54 @@ func (s *Server) handleInfo(w http.ResponseWriter, r *http.Request) {
 		"port":       s.cfg.Port,
 		"upload_dir": s.cfg.UploadDir,
 	})
+}
+
+// connectURL builds the LAN URL phones should open (PIN embedded when set).
+func (s *Server) connectURL() string {
+	u := url.URL{
+		Scheme: "http",
+		Host:   net.JoinHostPort(s.cfg.HostIP, strconv.Itoa(s.cfg.Port)),
+		Path:   "/",
+	}
+	if s.cfg.PIN != "" {
+		query := u.Query()
+		query.Set("pin", s.cfg.PIN)
+		u.RawQuery = query.Encode()
+	}
+	return u.String()
+}
+
+// handleQR serves the connect QR code so phones can scan straight off the
+// desktop/browser UI. Auth-protected because the QR (and JSON mode) exposes
+// the PIN. `format=json` returns the URL and PIN for on-screen display.
+func (s *Server) handleQR(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		w.Header().Set("Allow", http.MethodGet+", "+http.MethodHead)
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	connectURL := s.connectURL()
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+
+	if r.URL.Query().Get("format") == "json" {
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"url": connectURL,
+			"pin": s.cfg.PIN,
+		})
+		return
+	}
+
+	qr, err := qrcode.Encode(connectURL, qrcode.Medium)
+	if err != nil {
+		http.Error(w, "failed to encode QR: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "image/svg+xml; charset=utf-8")
+	w.Header().Set("Content-Security-Policy", "default-src 'none'; sandbox")
+	_, _ = w.Write([]byte(qr.ToSVG()))
 }
 
 func (s *Server) handleAuth(w http.ResponseWriter, r *http.Request) {

@@ -15,10 +15,10 @@
 
 | Feature | Description |
 | :--- | :--- |
-| 🖥 **Desktop app** | `LAN-Drop-Desktop-windows-x64.exe`: native WebView2 window, double-click and go, close to stop |
+| 🖥 **Desktop app** | `LAN-Drop-Desktop-windows-x64.exe`: native WebView2 window with a built-in phone connection QR code, double-click and go, close to stop |
 | 📱 **Android app** | `landrop-android.apk`: scan or type the address, remembers recent servers |
 | 📦 **Single binary, zero deps** | All web assets embedded at compile time via `//go:embed`; nothing to install on the target machine |
-| 📱 **Scan to connect** | Renders a QR code in the terminal (one per NIC); point any phone camera at it and you're in |
+| 📱 **Scan to connect** | Shows a QR code in the Windows desktop app or CLI terminal; point any phone camera at it and you're in |
 | 🧠 **Smart NIC detection** | Filters Docker / VMware / WSL / Hyper-V / VPN virtual adapters and prefers real physical LAN IPs |
 | 🔒 **Session-grade security** | Dynamic 4-digit PIN with constant-time comparison and lockout after repeated failures; login mints a random 256-bit session token (the PIN itself is never a cookie); WebSocket Origin checking blocks CSWSH |
 | 🚀 **Parallel chunked upload** | 4MB chunks, 3 concurrent streams, temp-spill + atomic merge on the server; steady-state memory 15–30MB for any file size |
@@ -34,7 +34,7 @@
 
 ## 🚀 Quick Start
 
-Grab a build from [**Releases**](https://github.com/GodBook/lan-drop/releases): **Windows desktop app** (`LAN-Drop-Desktop-windows-x64.exe`, native window), **Android client** (`landrop-android.apk`), or CLI binaries for Windows / macOS / Linux. Alternatively:
+Grab a build from [**Releases**](https://github.com/GodBook/lan-drop/releases): **Windows desktop app** (`LAN-Drop-Desktop-windows-x64.exe`, native window with a connection QR dialog), **Android client** (`landrop-android.apk`), or CLI binaries for Windows / macOS / Linux. Alternatively:
 
 ```bash
 # Docker
@@ -62,6 +62,7 @@ Authentication via `?pin=` query param, `X-PIN` header, or the `landrop_session`
 | Path | Method | Description |
 | :--- | :--- | :--- |
 | `/api/info` | GET | Hostname, IP, port, storage dir |
+| `/api/qr` | GET | Auth-protected connection QR as SVG; `?format=json` returns the URL and PIN |
 | `/api/auth` | POST | `{"pin":"1234"}` → session cookie |
 | `/api/upload/chunk` | POST | Upload one 4MB chunk (multipart) |
 | `/api/upload/status` | GET | Which chunks of a `file_id` already arrived (resume core) |

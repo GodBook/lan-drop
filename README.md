@@ -18,10 +18,10 @@
 
 | 特性 | 说明 |
 | :--- | :--- |
-| 🖥 **桌面应用** | Windows 端 `LAN-Drop-Desktop.exe`：原生 WebView2 窗口，双击即用、关窗即停，无终端无浏览器 |
+| 🖥 **桌面应用** | Windows 端 `LAN-Drop-Desktop.exe`：原生 WebView2 窗口，顶部二维码供手机扫码直连，双击即用、关窗即停 |
 | 📱 **安卓应用** | `landrop-android.apk`：app 内扫码 / 输 IP 直连，记住常用服务器，支持系统文件选择器与下载管理 |
 | 📦 **单文件零依赖** | 服务端核心 100% Go 标准库；Web 资源编译期内嵌，CLI 二进制下载即用 |
-| 📱 **扫码直连** | 启动后在终端渲染二维码（仅物理网卡），手机系统相机 / 微信 / LAN Drop App 扫码即达 |
+| 📱 **扫码直连** | Windows 桌面端弹窗或命令行终端显示二维码，手机系统相机 / 微信 / LAN Drop App 扫码即达 |
 | 🧠 **智能网卡探测** | 自动过滤 Docker / VMware / WSL / Hyper-V / VPN 等虚拟网卡，优先返回真实物理局域网 IP |
 | 🔒 **会话级安全** | 动态 4 位 PIN + 常数时间比较 + 连续失败锁定（防穷举）；登录签发随机 256 位会话令牌，PIN 明文永不出现在 Cookie；WebSocket 校验 Origin 防 CSWSH |
 | 🚀 **并发分片上传** | 前端按 4MB 分块、3 路并发流式上传，服务端临时分块落盘 + 原子合并，任意大小文件常驻内存仅 15~30MB |
@@ -50,7 +50,7 @@
 | macOS Intel | `landrop-darwin-amd64` | 命令行版 |
 | Linux x64 / arm64 (树莓派) | `landrop-linux-amd64` / `landrop-linux-arm64` | 命令行版 |
 
-**Windows 用户**：普通用户直接双击 `LAN-Drop-Desktop-windows-x64.exe`——原生窗口打开即是操作界面（需要 Windows 10/11 自带的 WebView2 运行时，系统默认已内置），关闭窗口即停止服务。需要终端二维码时使用命令行版 `landrop-windows-amd64.exe`（或 `start.bat`）。
+**Windows 用户**：普通用户直接双击 `LAN-Drop-Desktop-windows-x64.exe`——原生窗口打开即是操作界面（需要 Windows 10/11 自带的 WebView2 运行时，系统默认已内置），点击顶部“连接二维码”即可让手机扫码直连，关闭窗口即停止服务。需要终端模式时使用命令行版 `landrop-windows-amd64.exe`（或 `start.bat`）。
 
 **安卓用户**：下载 `landrop-android.apk` 安装（需在系统里允许"安装未知来源应用"），打开后扫码或输入 `IP:端口` 即可连接，最近用过的服务器会自动记住。
 
@@ -108,7 +108,7 @@ go build -ldflags="-s -w" -o landrop .
 
 ```
 ==================================================================
-   ⚡ LAN Drop v1.1.0 - 局域网极简跨设备文件与文本极速快传站
+   ⚡ LAN Drop v1.4.0 - 局域网极简跨设备文件与文本极速快传站
 ==================================================================
  🌐 局域网访问地址 : http://192.168.1.5:8087/?pin=8579
  🔒 访问 PIN 码    : 8579 (扫码可直接免密进入)
@@ -133,7 +133,7 @@ go build -ldflags="-s -w" -o landrop .
 
 ### 传输流程
 
-1. 电脑启动 `landrop`，终端出现二维码（多网卡时每个网卡各一个）；
+1. Windows 桌面端点击顶部“连接二维码”，或启动 `landrop` 在终端查看二维码；
 2. 手机连接**同一 Wi-Fi**，扫码打开网页（扫码自动免 PIN，Cookie 为随机会话令牌）；
 3. 手机选相册文件 / 拖入任意文件 / PC 直接 Ctrl+V 粘贴截图 → 分片并发上传；
 4. 任意设备在文本框输入内容 → 所有在线设备实时同步，一键复制；
@@ -148,6 +148,7 @@ go build -ldflags="-s -w" -o landrop .
 | 路径 | 方法 | 说明 |
 | :--- | :--- | :--- |
 | `/api/info` | GET | 获取主机名、IP、端口与存储目录 |
+| `/api/qr` | GET | 获取受鉴权保护的连接二维码 SVG；`?format=json` 返回连接地址与 PIN |
 | `/api/auth` | POST | 提交 `{"pin":"1234"}` 完成鉴权并下发会话 Cookie（连续失败 5 次锁定 30 秒） |
 | `/api/upload/chunk` | POST | 上传单个 4MB 分片（Multipart: `file_id` / `chunk_index` / `total_chunks` / `filename` / `chunk`） |
 | `/api/upload/status` | GET | 查询 `file_id` 已到货的分片列表（断点续传核心） |
@@ -171,7 +172,7 @@ lan-drop/
 ├── core/                        # 服务端核心库（CLI 与桌面应用共用）
 │   ├── console/                 # Windows 终端 ANSI/VT 支持
 │   ├── network/ip.go            # 局域网物理网卡智能过滤、可用端口自动探测
-│   ├── qrcode/qrcode.go         # 纯 Go 实现的终端二维码编码与渲染引擎
+│   ├── qrcode/qrcode.go         # 纯 Go 实现的终端 / SVG 二维码编码与渲染引擎
 │   └── server/
 │       ├── config.go            # 配置、会话令牌、PIN 常数时间比较、限速、文本环形缓冲与落盘
 │       ├── handler.go           # HTTP 路由、鉴权中间件、静态资源 ETag 缓存
@@ -190,7 +191,7 @@ lan-drop/
 
 ```bash
 # 本平台编译
-go build -ldflags="-s -w -X main.AppVersion=1.3.1" -o landrop .
+go build -ldflags="-s -w -X main.AppVersion=1.4.0" -o landrop .
 
 # Makefile 一键全平台（版本号自动注入）
 make build-all
@@ -206,7 +207,7 @@ make build-all
 
 ```bash
 cd desktop
-go build -ldflags="-s -w -H windowsgui -X main.AppVersion=1.3.1" -o LAN-Drop-Desktop.exe .
+go build -ldflags="-s -w -H windowsgui -X main.AppVersion=1.4.0" -o LAN-Drop-Desktop.exe .
 ```
 
 ### 安卓端单独编译

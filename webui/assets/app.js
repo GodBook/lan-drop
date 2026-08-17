@@ -32,6 +32,18 @@
   const btnSubmitPin = document.getElementById("btn-submit-pin");
   const previewModalEl = document.getElementById("preview-modal");
   const previewBodyEl = document.getElementById("preview-body");
+  const btnShowQREl = document.getElementById("btn-show-qr");
+  const qrModalEl = document.getElementById("qr-modal");
+  const qrImageEl = document.getElementById("qr-image");
+  const qrLoadingEl = document.getElementById("qr-loading");
+  const qrDetailsEl = document.getElementById("qr-details");
+  const qrURLEl = document.getElementById("qr-url");
+  const qrPINHintEl = document.getElementById("qr-pin-hint");
+  const btnCloseQREl = document.getElementById("btn-close-qr");
+  const btnCopyQRURLEl = document.getElementById("btn-copy-qr-url");
+  let qrImageObjectURL = "";
+  let qrPreviousFocus = null;
+  let qrRequestID = 0;
 
   // Init: listeners bind once; auth + data loading can re-run after PIN entry
   init();
@@ -40,6 +52,9 @@
     if (!listenersBound) {
       setupEventListeners();
       listenersBound = true;
+    }
+    if (isLoopbackHost(window.location.hostname)) {
+      btnShowQREl.hidden = false;
     }
     await checkAuthAndLoadInfo();
     connectWebSocket();
@@ -495,6 +510,58 @@
     previewBodyEl.innerHTML = ""; // stop media playback
   }
 
+  async function openQRModal() {
+    const requestID = ++qrRequestID;
+    qrPreviousFocus = document.activeElement;
+    btnShowQREl.setAttribute("aria-expanded", "true");
+    qrModalEl.style.display = "flex";
+    qrImageEl.hidden = true;
+    qrDetailsEl.hidden = true;
+    qrLoadingEl.hidden = false;
+    qrLoadingEl.textContent = "正在生成二维码...";
+    btnCloseQREl.focus();
+
+    try {
+      const [detailsRes, imageRes] = await Promise.all([
+        fetch("/api/qr?format=json", { cache: "no-store" }),
+        fetch("/api/qr", { cache: "no-store" }),
+      ]);
+      if (!detailsRes.ok || !imageRes.ok) {
+        throw new Error(detailsRes.status === 401 || imageRes.status === 401 ? "请先完成身份验证" : "二维码生成失败");
+      }
+
+      const details = await detailsRes.json();
+      const imageBlob = await imageRes.blob();
+      if (requestID !== qrRequestID || qrModalEl.style.display === "none") return;
+      if (qrImageObjectURL) URL.revokeObjectURL(qrImageObjectURL);
+      qrImageObjectURL = URL.createObjectURL(imageBlob);
+      qrImageEl.src = qrImageObjectURL;
+      qrURLEl.textContent = details.url || "";
+      qrPINHintEl.textContent = details.pin ? `访问 PIN：${details.pin}` : "无需访问 PIN";
+      qrLoadingEl.hidden = true;
+      qrImageEl.hidden = false;
+      qrDetailsEl.hidden = false;
+    } catch (err) {
+      if (requestID !== qrRequestID || qrModalEl.style.display === "none") return;
+      qrLoadingEl.textContent = err.message || "二维码加载失败";
+      showToast(qrLoadingEl.textContent, "error");
+    }
+  }
+
+  function closeQRModal() {
+    qrRequestID++;
+    qrModalEl.style.display = "none";
+    btnShowQREl.setAttribute("aria-expanded", "false");
+    if (qrImageObjectURL) {
+      URL.revokeObjectURL(qrImageObjectURL);
+      qrImageObjectURL = "";
+      qrImageEl.removeAttribute("src");
+    }
+    if (qrPreviousFocus && typeof qrPreviousFocus.focus === "function") {
+      qrPreviousFocus.focus();
+    }
+  }
+
   async function deleteFile(fileName) {
     if (!confirm(`确定在服务端删除文件 "${fileName}" 吗？`)) return;
     try {
@@ -624,6 +691,16 @@
       });
     }
 
+    btnShowQREl.addEventListener("click", openQRModal);
+    btnCloseQREl.addEventListener("click", closeQRModal);
+    btnCopyQRURLEl.addEventListener("click", () => copyToClipboard(qrURLEl.textContent));
+    qrModalEl.addEventListener("click", (e) => {
+      if (e.target === qrModalEl) closeQRModal();
+    });
+    document.addEventListener("keydown", (e) => {
+      if (e.key === "Escape" && qrModalEl.style.display !== "none") closeQRModal();
+    });
+
     // Ask for notification permission after the first interaction
     document.addEventListener("click", requestNotifyPermission, { once: true });
   }
@@ -636,6 +713,10 @@
     const sizes = ["B", "KB", "MB", "GB", "TB"];
     const i = Math.min(Math.floor(Math.log(bytes) / Math.log(k)), sizes.length - 1);
     return parseFloat((bytes / Math.pow(k, i)).toFixed(1)) + " " + sizes[i];
+  }
+
+  function isLoopbackHost(hostname) {
+    return hostname === "localhost" || hostname === "127.0.0.1" || hostname === "::1";
   }
 
   function truncate(str, n) {

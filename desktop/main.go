@@ -23,7 +23,7 @@ import (
 
 // AppVersion is overridden at build time via
 // -ldflags "-X main.AppVersion=<version>".
-var AppVersion = "1.3.1"
+var AppVersion = "1.4.0"
 
 const (
 	defaultPort       = 8087

@@ -18,6 +18,15 @@
       </div>
       <div class="server-info">
         <span id="server-name">Loading...</span>
+        <button class="btn-secondary btn-sm btn-qr" id="btn-show-qr" type="button" title="显示连接二维码" aria-haspopup="dialog" aria-controls="qr-modal" aria-expanded="false" hidden>
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
+            <rect width="5" height="5" x="3" y="3" rx="1"></rect>
+            <rect width="5" height="5" x="16" y="3" rx="1"></rect>
+            <rect width="5" height="5" x="3" y="16" rx="1"></rect>
+            <path d="M16 16h2v2h-2zM21 16v5h-5M21 21h.01"></path>
+          </svg>
+          连接二维码
+        </button>
         <div class="status-badge" id="conn-status">
           <span class="status-dot"></span>
           <span id="conn-text">已连接</span>
@@ -100,6 +109,37 @@
   <!-- Media Preview Modal -->
   <div class="modal-overlay preview-overlay" id="preview-modal" style="display: none;">
     <div class="preview-body" id="preview-body"></div>
+  </div>
+
+  <!-- Connect QR Modal -->
+  <div class="modal-overlay" id="qr-modal" role="dialog" aria-modal="true" aria-labelledby="qr-title" style="display: none;">
+    <div class="modal qr-modal">
+      <div class="qr-modal-header">
+        <h2 id="qr-title">手机连接</h2>
+        <button class="icon-button" id="btn-close-qr" type="button" title="关闭" aria-label="关闭二维码">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
+            <path d="M18 6 6 18M6 6l12 12"></path>
+          </svg>
+        </button>
+      </div>
+      <div class="qr-image-box">
+        <div class="qr-loading" id="qr-loading" role="status">正在生成二维码...</div>
+        <img id="qr-image" width="232" height="232" alt="LAN Drop 手机连接二维码" hidden>
+      </div>
+      <div class="qr-details" id="qr-details" hidden>
+        <div class="qr-detail-label">连接地址</div>
+        <div class="qr-address-row">
+          <code class="qr-url" id="qr-url"></code>
+          <button class="icon-button qr-copy-button" id="btn-copy-qr-url" type="button" title="复制连接地址" aria-label="复制连接地址">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
+              <rect width="14" height="14" x="8" y="8" rx="2"></rect>
+              <path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"></path>
+            </svg>
+          </button>
+        </div>
+        <div class="qr-pin-hint" id="qr-pin-hint"></div>
+      </div>
+    </div>
   </div>
 
   <script src="/app.js"></script>
