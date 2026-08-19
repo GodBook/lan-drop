@@ -1,5 +1,5 @@
 APP_NAME := landrop
-VERSION := 1.5.0
+VERSION := 1.5.1
 BUILD_DIR := dist
 LDFLAGS := -s -w -X main.AppVersion=$(VERSION)
 

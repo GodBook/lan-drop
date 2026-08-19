@@ -21,6 +21,11 @@
 
 Before publishing, configure a completely new Android signing key in GitHub Actions Secrets. The legacy key was exposed; users upgrading from older APKs must uninstall before installing 1.5.0.
 
+### 1.5.1 patch
+
+- Fixed missing application icons in the Windows desktop and CLI executables.
+- The system tray, taskbar, window and File Explorer now share the LAN Drop icon.
+
 ## ✨ Highlights
 
 | Feature | Description |

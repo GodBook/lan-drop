@@ -24,6 +24,11 @@
 
 发布时请在 GitHub Actions Secrets 配置全新的 Android 签名密钥；旧签名已经公开，旧版用户升级到 1.5.0 前需要卸载旧 APK。
 
+### 1.5.1 补丁
+
+- 修复 Windows 桌面端和命令行 EXE 缺少应用图标的问题。
+- 系统托盘、任务栏、窗口和文件管理器现在使用统一的 LAN Drop 专属图标。
+
 ## ✨ 核心特性
 
 | 特性 | 说明 |
@@ -120,7 +125,7 @@ go build -ldflags="-s -w" -o landrop .
 
 ```
 ==================================================================
-   ⚡ LAN Drop v1.5.0 - 局域网极简跨设备文件与文本极速快传站
+   ⚡ LAN Drop v1.5.1 - 局域网极简跨设备文件与文本极速快传站
 ==================================================================
  🌐 局域网访问地址 : http://192.168.1.5:8087/?pin=8579
  🔒 访问 PIN 码    : 8579 (扫码可直接免密进入)
@@ -207,7 +212,7 @@ lan-drop/
 
 ```bash
 # 本平台编译
-go build -ldflags="-s -w -X main.AppVersion=1.5.0" -o landrop .
+go build -ldflags="-s -w -X main.AppVersion=1.5.1" -o landrop .
 
 # Makefile 一键全平台（版本号自动注入）
 make build-all
@@ -223,7 +228,7 @@ make build-all
 
 ```bash
 cd desktop
-go build -ldflags="-s -w -H windowsgui -X main.AppVersion=1.5.0" -o LAN-Drop-Desktop.exe .
+go build -ldflags="-s -w -H windowsgui -X main.AppVersion=1.5.1" -o LAN-Drop-Desktop.exe .
 ```
 
 ### 安卓端单独编译
