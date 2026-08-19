@@ -25,7 +25,7 @@ Before publishing, configure a completely new Android signing key in GitHub Acti
 
 | Feature | Description |
 | :--- | :--- |
-| 🖥 **Desktop app** | `LAN-Drop-Desktop-windows-x64.exe`: single instance, native tray, minimize/close to tray, open receive folder, copy address, and switch adapter or storage directory at runtime |
+| 🖥 **Desktop app** | `LAN-Drop-Desktop-windows-x64.exe`: ships with the LAN Drop app icon, single instance, native tray, minimize/close to tray, open receive folder, copy address, and switch adapter or storage directory at runtime |
 | 📱 **Android app** | `landrop-android.apk`: discovers computers through NSD, with QR/manual connection and origin-only recent-server history |
 | 📦 **Single binary, zero deps** | All web assets embedded at compile time via `//go:embed`; nothing to install on the target machine |
 | 📱 **Scan to connect** | Shows a QR code in the Windows desktop app or CLI terminal; point any phone camera at it and you're in |

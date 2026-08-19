@@ -50,6 +50,7 @@ var (
 	procSetWindowLongPtrW = user32.NewProc("SetWindowLongPtrW")
 	procCallWindowProcW   = user32.NewProc("CallWindowProcW")
 	procLoadIconW         = user32.NewProc("LoadIconW")
+	procGetModuleHandleW  = kernel32.NewProc("GetModuleHandleW")
 	procCreatePopupMenu   = user32.NewProc("CreatePopupMenu")
 	procAppendMenuW       = user32.NewProc("AppendMenuW")
 	procTrackPopupMenu    = user32.NewProc("TrackPopupMenu")
@@ -116,7 +117,11 @@ func newDesktopTray(window webview2.WebView, actions trayActions) (*desktopTray,
 	}
 	tray.oldProc = oldProc
 
-	icon, _, _ := procLoadIconW.Call(0, idiApplication)
+	module, _, _ := procGetModuleHandleW.Call(0)
+	icon, _, _ := procLoadIconW.Call(module, 1) // Resource ID 1 from lan-drop.ico.
+	if icon == 0 {
+		icon, _, _ = procLoadIconW.Call(0, idiApplication)
+	}
 	tray.data = notifyIconData{
 		Size:            uint32(unsafe.Sizeof(notifyIconData{})),
 		Window:          hwnd,
